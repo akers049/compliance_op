@@ -7,7 +7,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-
+#include <algorithm>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -21,16 +21,33 @@ namespace Comp_Op
 {
 /******************** ElmData member functions **********************/
 
-  ElmData::ElmData(unsigned int dim, double pen)
+  ElmData::ElmData(unsigned int dim, double pen, unsigned int eID,
+      std::vector<unsigned int> &nodeIds,
+      std::vector<std::vector<float> > &globalNodePos)
   :
   dim_(dim),
-  penal_(pen)
+  penal_(pen),
+  elmID(eID),
+  rho_(0.0)
   {
     num_vertex = pow(2, dim);
     num_dofs = num_vertex*dim;
 
     elmStiffnessMat.resize(num_dofs, std::vector<float> (num_dofs));
     localToGlobal.resize(num_dofs);
+    center.resize(DIM, 0.0);
+    float multFactor = 1.0/(1.0*num_vertex);
+    for(unsigned int i = 0; i < num_vertex; i ++)
+    {
+      nodePos.push_back(globalNodePos[nodeIds[i]-1]);
+
+      for(unsigned int k = 0; k < DIM; k ++)
+        center[k] += multFactor*globalNodePos[nodeIds[i]-1][k];
+    }
+
+    volume_ = 1.0;
+    node_indicies = nodeIds;
+
   }
 
   void ElmData::set_elm_stiffness(std::vector<unsigned int> &local_inds,
@@ -57,6 +74,17 @@ namespace Comp_Op
       }
   }
 
+  float ElmData::dist(ElmData *otherElm)
+  {
+    float distance = 0.0;
+    for(unsigned int i = 0; i < dim_; i ++)
+      distance += (center[i]- otherElm->center[i])*(center[i]- otherElm->center[i]);
+
+    distance = sqrt(distance);
+
+    return distance;
+  }
+
   float ElmData::compute_sensitivity(const std::vector<float> &u, float rho_e)
   {
     float sensitivity = 0.0;
@@ -71,6 +99,8 @@ namespace Comp_Op
 
     float multFactor = -penal_/rho_e;
     sensitivity *= multFactor;
+
+    sensitivity_ = sensitivity;
 
     return sensitivity;
   }
@@ -88,22 +118,273 @@ namespace Comp_Op
     N = 200;
     N_nodes = 231;
     N_dofs = 440;
+    R_filter = 2.0;
+    V_tot = 0.0;
 
     firstFlag = true;
 
-    node_ind_dofs.resize(N_nodes, std::vector<int>(2));
+    node_ind_dofs.resize(N_nodes, std::vector<int>(DIM));
+    node_pos.resize(N_nodes, std::vector<float>(DIM));
+
     u.resize(N_dofs);
     sensitivities.resize(N);
-    ElmDatas.resize(N, ElmData(DIM, penal));
+    sensitivities_filtered.resize(N, 0.0);
 
     rho.resize(N);
     std::fill(rho.begin(), rho.end(), volFrac);
 
+
   }
+
+  void compliance_opt::initialize(char* static_dir)
+  {
+    chdir(static_dir);
+    getcwd(ls_static_dir, MAXLINE);
+    chdir("-");
+
+    read_node_data();
+    write_element_file();
+    update_element_rhos();
+    write_part_file();
+
+    update_element_neighbors();
+
+  }
+
+  void compliance_opt::postprocess()
+  {
+    // just gotta do this once
+    if(internal_iter == 0)
+      update_element_vols();
+
+    read_displacements();
+    set_element_stiffness();
+    compute_sensitivities();
+    filter_sensitivities();
+  }
+
+  float compliance_opt::iterate(unsigned int iter)
+  {
+    if(internal_iter != 0)
+    {
+      update_rho();
+      update_element_rhos();
+    }
+    run_ls_dyna(iter);
+    postprocess();
+
+    internal_iter++;
+
+    write_vtk(iter);
+    update_rho();
+    update_element_rhos();
+    write_vtk(iter+1);
+
+
+    return compute_objective();
+
+  }
+
+  void compliance_opt::read_node_data()
+    {
+  //    char nodeFileName[MAXLINE];
+  //    strcpy(nodeFileName, iter_dir);
+  //    strcat(nodeFileName, "/Node_Data_0001_001");
+  //
+  //    FILE* nodeFile;
+  //    nodeFile = fopen(nodeFileName, "r");
+  //    if(nodeFile == NULL)
+  //    {
+  //      std::cout << "Error opening node file, Exiting.\n" << std::endl;
+  //      exit(1);
+  //    }
+
+  //    int dummy;
+  //    std::vector<int> tmp(DIM);
+  //    char nextLine[MAXLINE];
+  //    for(unsigned int i = 0; i < 4; i ++)
+  //      getNextDataLine(nodeFile, nextLine,MAXLINE, &dummy);
+  //
+  //    unsigned int valuesWritten;
+  //    char *tokPtr;
+  //    for(unsigned int i = 0; i < N_nodes; i ++)
+  //    {
+  //      getNextDataLine(nodeFile, nextLine, MAXLINE, &dummy);
+  //      tokPtr = strtok(nextLine, " ");
+  //      for(unsigned int k = 0; k < DIM; k ++)
+  //      {
+  //        tokPtr = strtok(NULL, " ");
+  //        valuesWritten = sscanf(tokPtr, "%d", &(tmp[k]));
+  //        if(valuesWritten != 1)
+  //        {
+  //          std::cout << "Error reading node file. Exiting \n" << std::endl;
+  //          exit(-1);
+  //        }
+  //        node_ind_dofs[i][k] = tmp[k] - 1;
+  //      }
+  //    }
+  //
+  //    fclose(nodeFile);
+  //    std::cout << "Sucessfully read node file.\n";
+
+      // first read the ls_info.k file to get the constrained nodes.
+      char infoFileName[MAXLINE];
+      strcpy(infoFileName, ls_static_dir);
+      strcat(infoFileName, "/ls_info.k");
+
+      FILE* infoFile;
+      infoFile = fopen(infoFileName, "r");
+      if(infoFile == NULL)
+      {
+        std::cout << "Error opening node file, Exiting.\n" << std::endl;
+        exit(1);
+      }
+
+      // read in the fixed nodes
+      unsigned int valuesWritten;
+      char nextLine[MAXLINE];
+      int fileEndFlag;
+      getNextDataLine(infoFile, nextLine, MAXLINE, &fileEndFlag, false);
+      while(fileEndFlag == false)
+      {
+        if(strncmp(nextLine, "*SET_NODE_LIST_TITLE", 20) == 0)
+        {
+          // skip this one
+          getNextDataLine(infoFile, nextLine, MAXLINE, &fileEndFlag, false);
+
+          // line with sid
+          unsigned int sid;
+          getNextDataLine(infoFile, nextLine, MAXLINE, &fileEndFlag, false);
+          if(fileEndFlag == true)
+          {
+            std::cout << "Error 1 reading ls_info.k file, Exiting.\n" << std::endl;
+            exit(-1);
+          }
+          valuesWritten = sscanf(nextLine, "%u", &sid);
+          if(valuesWritten != 1)
+          {
+            std::cout << nextLine << std::endl;
+            std::cout << "Error 2 reading ls_info.k file, Exiting.\n" << std::endl;
+            exit(-1);
+          }
+          if(sid == 1)
+            break;
+        }
+
+        getNextDataLine(infoFile, nextLine, MAXLINE, &fileEndFlag, false);
+      }
+      if(fileEndFlag == true)
+      {
+        std::cout << "Error 3 reading ls_info.k file, Exiting.\n" << std::endl;
+        exit(1);
+      }
+
+      std::vector<unsigned int> node_nums(8);
+      getNextDataLine(infoFile, nextLine, MAXLINE, &fileEndFlag, false);
+      while(fileEndFlag == false)
+      {
+        valuesWritten = sscanf(nextLine,
+            "%u %u %u %u %u %u %u %u",
+            &node_nums[0], &node_nums[1], &node_nums[2], &node_nums[3],
+            &node_nums[4], &node_nums[5], &node_nums[6], &node_nums[7]);
+
+        if(valuesWritten == 0)
+          break;
+        else
+        {
+          for(unsigned int i = 0 ; i < valuesWritten; i ++)
+          {
+            if(node_nums[i] == 0)
+              continue;
+
+            fixedNodes.push_back(node_nums[i] - 1);
+          }
+        }
+
+        getNextDataLine(infoFile, nextLine, MAXLINE, &fileEndFlag, false);
+      }
+      if(fileEndFlag == true)
+      {
+        std::cout << "Error 4 reading ls_info.k file, Exiting.\n" << std::endl;
+        exit(1);
+      }
+
+      unsigned int count = 0;
+      for(unsigned int i = 0; i < N_nodes; i ++)
+      {
+        bool found;
+        std::vector<unsigned int>::iterator it = std::find(fixedNodes.begin(), fixedNodes.end(), i);
+        if(it == fixedNodes.end())
+          found = false;
+        else
+          found = true;
+
+        for(unsigned int k = 0; k < DIM; k ++)
+        {
+          if(found == true)
+            node_ind_dofs[i][k] = -1;
+          else
+          {
+            node_ind_dofs[i][k] = count;
+            count ++;
+          }
+        }
+      }
+
+      getNextDataLine(infoFile, nextLine, MAXLINE, &fileEndFlag, false);
+      while(fileEndFlag == false)
+      {
+        if(strncmp(nextLine, "*NODE", 5) == 0)
+          break;
+
+        getNextDataLine(infoFile, nextLine, MAXLINE, &fileEndFlag, false);
+      }
+      if(fileEndFlag == true)
+      {
+        std::cout << "Error 5 reading ls_info.k file, Exiting.\n" << std::endl;
+        exit(1);
+      }
+
+      char* tokPtr;
+      unsigned int nid;
+      for(unsigned int i = 0; i < N_nodes; i ++)
+      {
+        getNextDataLine(infoFile, nextLine, MAXLINE, &fileEndFlag, false);
+        if(fileEndFlag == true)
+        {
+          std::cout << "Error 6 reading ls_info.k file, Exiting.\n" << std::endl;
+          exit(1);
+        }
+        tokPtr = strtok(nextLine, " ");
+        valuesWritten = sscanf(tokPtr, "%u", &nid);
+        if(valuesWritten != 1)
+        {
+          std::cout << "Error 7 reading ls_info.k file, Exiting.\n" << std::endl;
+          exit(1);
+        }
+
+        for(unsigned int k = 0; k < DIM; k ++)
+        {
+          tokPtr = strtok(NULL, " ");
+          valuesWritten = sscanf(tokPtr, "%f", &node_pos[nid - 1][k]);
+          if(valuesWritten != 1)
+          {
+            std::cout << "Error 8 reading ls_info.k file, Exiting.\n" << std::endl;
+            exit(1);
+          }
+        }
+      }
+      fclose(infoFile);
+
+      std::cout << "Sucessfully read node file.\n";
+
+
+    }
 
   void compliance_opt::write_element_file()
   {
-    unsigned int eid, pid, n1, n2, n3, n4, n5, n6, n7, n8;
+    unsigned int eid, pid;
+    std::vector<unsigned int > n(8);
 
     chdir(ls_static_dir);
 
@@ -135,21 +416,23 @@ namespace Comp_Op
     int valuesWritten = 0;
 
     getNextDataLine(fid, nextLine,MAXLINE, &fileEndFlag);
+    getNextDataLine(fid, nextLine,MAXLINE, &fileEndFlag);
     valuesWritten = sscanf(nextLine, "%u %u %u %u %u %u %u %u %u %u",
-                            &eid, &pid, &n1, &n2, &n3, &n4, &n5, &n6, &n7, &n8);
+            &eid, &pid, &n[0], &n[1], &n[2], &n[3], &n[4], &n[5], &n[6], &n[7]);
     if (valuesWritten != 10)
     {
       fileReadErrorFlag = true;
     }
-
     while(fileEndFlag == false && fileReadErrorFlag == false)
     {
+
+      ElmDatas.push_back(ElmData(DIM, penal, eid, n, node_pos));
       fprintf(fid_w, "%8u%8u%8u%8u%8u%8u%8u%8u%8u%8u\n",
-        eid, eid, n1, n2, n3, n4, n5, n6, n7, n8);
+        eid, eid, n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7]);
 
       getNextDataLine(fid, nextLine,MAXLINE, &fileEndFlag);
       valuesWritten = sscanf(nextLine, "%u %u %u %u %u %u %u %u %u %u",
-                            &eid, &pid, &n1, &n2, &n3, &n4, &n5, &n6, &n7, &n8);
+          &eid, &pid, &n[0], &n[1], &n[2], &n[3], &n[4], &n[5], &n[6], &n[7]);
       if (valuesWritten != 10)
       {
         fileReadErrorFlag = true;
@@ -169,8 +452,6 @@ namespace Comp_Op
     else
      std::cout << "Successfully wrote element file" << std::endl;
 
-    char tmp[MAXLINE];
-    getcwd(ls_static_dir, MAXLINE);
 
     std::cout << "Element File Sucessfully Written\n";
 
@@ -304,57 +585,10 @@ namespace Comp_Op
 
   }
 
-  void compliance_opt::read_node_inds()
-  {
-    char nodeFileName[MAXLINE];
-    strcpy(nodeFileName, iter_dir);
-    strcat(nodeFileName, "/Node_Data_0001_001");
 
-    FILE* nodeFile;
-    nodeFile = fopen(nodeFileName, "r");
-    if(nodeFile == NULL)
-    {
-      std::cout << "Error opening node file, Exiting.\n" << std::endl;
-      exit(1);
-    }
-
-    int dummy;
-    std::vector<int> tmp(DIM);
-    char nextLine[MAXLINE];
-    for(unsigned int i = 0; i < 4; i ++)
-      getNextDataLine(nodeFile, nextLine,MAXLINE, &dummy);
-
-    unsigned int valuesWritten;
-    char *tokPtr;
-    for(unsigned int i = 0; i < N_nodes; i ++)
-    {
-      getNextDataLine(nodeFile, nextLine, MAXLINE, &dummy);
-      tokPtr = strtok(nextLine, " ");
-      for(unsigned int k = 0; k < DIM; k ++)
-      {
-        tokPtr = strtok(NULL, " ");
-        valuesWritten = sscanf(tokPtr, "%d", &(tmp[k]));
-        if(valuesWritten != 1)
-        {
-          std::cout << "Error reading node file. Exiting \n" << std::endl;
-          exit(-1);
-        }
-        node_ind_dofs[i][k] = tmp[k] - 1;
-      }
-    }
-
-    fclose(nodeFile);
-    std::cout << "Sucessfully read node file.\n";
-  }
 
   void compliance_opt::read_displacements()
   {
-    if(firstFlag)
-    {
-      read_node_inds();
-      firstFlag = false;
-    }
-
     char dispFileName[MAXLINE];
     strcpy(dispFileName, iter_dir);
     strcat(dispFileName, "/nodout");
@@ -520,6 +754,222 @@ namespace Comp_Op
 
   }
 
+  void compliance_opt::filter_sensitivities()
+  {
+
+    for(unsigned int i = 0; i < N ; i ++)
+    {
+      float H_tot = R_filter;
+      sensitivities_filtered[i] += R_filter*ElmDatas[i].rho_*ElmDatas[i].sensitivity_;
+      for(unsigned int k = 0; k < ((ElmDatas[i]).neighborList).size(); k++)
+      {
+        float nextH = R_filter - ((ElmDatas[i]).neighborList)[k].second;
+        H_tot += nextH;
+        sensitivities_filtered[i] += nextH*ElmDatas[i].rho_*ElmDatas[i].sensitivity_;
+      }
+      sensitivities_filtered[i] *= (1.0/(ElmDatas[i].rho_*H_tot));
+    }
+  }
+
+  void compliance_opt::update_rho()
+  {
+    float l1 = 0;
+    float l2 = 100000;
+    float move = 0.2;
+    std::vector<float> rho_new(N, 0.0);
+    while (l2-l1 > 1e-4)
+    {
+      float lmid = 0.5*(l2+l1);
+      for(unsigned int i = 0; i < N; i ++)
+        rho_new[i] =std::max(rhoMin,(float) std::max(rho[i] - move,(float) std::min((float) 1.0,(float) std::min((float) (rho[i] + move),(float) (rho[i]*sqrt(-sensitivities_filtered[i]/lmid))))));
+
+      float V = 0.0;
+
+      for(unsigned int i = 0; i < N; i ++)
+        V += rho_new[i]*ElmDatas[i].volume_;
+
+      if (V - volFrac*V_tot > 0.0)
+        l1 = lmid;
+      else
+        l2 = lmid;
+    }
+
+    rho = rho_new;
+  }
+
+  void compliance_opt::update_element_rhos()
+  {
+    for(unsigned int i = 0; i < ElmDatas.size(); i ++)
+      ElmDatas[i].update_rho(rho[i]);
+
+  }
+
+  void compliance_opt::update_element_neighbors()
+  {
+    for(unsigned int i = 0; i < N; i ++)
+    {
+      for(unsigned int k = i+1; k < N; k ++)
+        if(k == i)
+          continue;
+        else
+        {
+          float next_dist = ElmDatas[i].dist(&(ElmDatas[k]));
+          if(next_dist < R_filter)
+          {
+            ElmDatas[i].add_neighbor(&(ElmDatas[k]), next_dist);
+            ElmDatas[k].add_neighbor(&(ElmDatas[i]), next_dist);
+          }
+        }
+    }
+  }
+
+  void compliance_opt::update_element_vols()
+  {
+    V_tot = 0.0;
+
+    char d3hspFileName[MAXLINE];
+    strcpy(d3hspFileName, iter_dir);
+    strcat(d3hspFileName, "/d3hsp");
+
+    FILE* d3hspFile;
+    d3hspFile = fopen(d3hspFileName, "r");
+    if(d3hspFile == NULL)
+    {
+      std::cout << "Error opening d3hsp file, Exiting.\n" << std::endl;
+      exit(1);
+    }
+
+    int fileEndFlag;
+    std::vector<int> tmp(DIM);
+    char nextLine[MAXLINE];
+    getNextDataLine(d3hspFile, nextLine, MAXLINE, &fileEndFlag, false);
+    while(fileEndFlag == 0)
+    {
+      if(strncmp(nextLine, " summary of mass", 16) == 0)
+        break;
+
+      getNextDataLine(d3hspFile, nextLine, MAXLINE, &fileEndFlag, false);
+    }
+    if(fileEndFlag == 1)
+    {
+      std::cout << "Error 1 reading d3hsp file. Exiting. \n" << std::endl;
+      exit(-1);
+    }
+
+    char* tokPtr;
+    for(unsigned int i = 0; i < N; i ++)
+    {
+      getNextDataLine(d3hspFile, nextLine, MAXLINE, &fileEndFlag, false);
+      if(fileEndFlag == 1)
+      {
+        std::cout << "Error 2 reading d3hsp file. Exiting. \n" << std::endl;
+        exit(-1);
+      }
+      tokPtr = strtok(nextLine, "=");
+      tokPtr = strtok(NULL, "=");
+      unsigned int eid;
+      float nextVol;
+      unsigned int valuesWritten = sscanf(tokPtr, "%u", &eid);
+      if(valuesWritten != 1)
+      {
+        std::cout << "Error 3 reading d3hsp file. Exiting. \n" << std::endl;
+        exit(-1);
+      }
+      tokPtr = strtok(NULL, "=");
+      valuesWritten = sscanf(tokPtr, "%f", &nextVol);
+      if(valuesWritten != 1)
+      {
+        std::cout << "Error 4 reading d3hsp file. Exiting. \n" << std::endl;
+        exit(-1);
+      }
+
+      bool foundFlag = false;
+      for(unsigned int k = i; k < N+i; k ++)
+      {
+        if(ElmDatas[k%N].elmID == eid)
+        {
+          foundFlag = true;
+          ElmDatas[k%N].set_vol(nextVol);
+          V_tot += nextVol;
+        }
+      }
+      if(foundFlag == false)
+      {
+        std::cout << "Error 5 reading d3hsp file. Exiting. \n" << std::endl;
+        exit(-1);
+      }
+
+    }
+
+
+
+  }
+
+  void compliance_opt::write_vtk(unsigned int iter)
+  {
+    char vtkFileName[MAXLINE];
+    char iterChar[MAXLINE];
+    sprintf(iterChar, "%u", iter);
+    strcpy(vtkFileName, run_dir);
+    strcat(vtkFileName, "/iter_");
+    strcat(vtkFileName, iterChar);
+    strcat(vtkFileName, ".vtk");
+
+    FILE* vtkFile;
+    vtkFile = fopen(vtkFileName, "w");
+    if(vtkFile == NULL)
+    {
+      std::cout << "Error opening vtk file : ";
+      std::cout << vtkFileName;
+      std::cout << ", Exiting.\n" << std::endl;
+      exit(1);
+    }
+    unsigned int numVert = pow(2, DIM);
+
+    fprintf(vtkFile, "# vtk DataFile Version 3.0\n#This file was generated by the ANDY library\nASCII\nDATASET UNSTRUCTURED_GRID\n\n");
+    fprintf(vtkFile, "POINTS %u float\n", N*numVert);
+    for(unsigned int i = 0; i < N; i ++)
+    {
+      for(unsigned int j = 0; j < numVert; j++)
+      {
+        for(unsigned int k = 0; k < DIM; k ++)
+          fprintf(vtkFile, "%f ", node_pos[ElmDatas[i].node_indicies[j] - 1][k]);
+
+        if(DIM < 3)
+          fprintf(vtkFile, "0");
+
+        fprintf(vtkFile, "\n");
+      }
+    }
+    fprintf(vtkFile, "\nCELLS %u %u\n", ElmDatas.size(), (ElmDatas.size() + N*numVert));
+    unsigned int count = 0;
+    for(unsigned int i = 0; i < N; i ++)
+    {
+      fprintf(vtkFile, "%u", numVert);
+      for(unsigned int k = 0; k < numVert; k ++)
+      {
+        fprintf(vtkFile, "\t%u", count);
+        count ++;
+//        fprintf(vtkFile, "\t%u", (ElmDatas[i].node_indicies[k] - 1));
+      }
+      fprintf(vtkFile, "\n");
+    }
+    fprintf(vtkFile, "\n");
+    unsigned int type = (DIM == 2 ? 9 : 12);
+    fprintf(vtkFile, "CELL_TYPES %u\n", N);
+    for(unsigned int i = 0; i < N; i++)
+      fprintf(vtkFile, " %u", type);
+    fprintf(vtkFile, "\n");
+
+    fprintf(vtkFile, "CELL_DATA %u\n", N);
+    fprintf(vtkFile, "SCALARS rho float\n");
+    fprintf(vtkFile, "LOOKUP_TABLE default\n");
+    for(unsigned int i = 0; i < N; i++)
+      fprintf(vtkFile, " %f", ElmDatas[i].rho_);
+    fprintf(vtkFile, "\n");
+    fclose(vtkFile);
+  }
+
   void compliance_opt::getNextDataLine( FILE* const filePtr, char* nextLinePtr,
                           int const maxSize, int* const endOfFileFlag, bool trimFlag)
   {
@@ -540,12 +990,13 @@ namespace Comp_Op
         }
       }
     }
-    while ((strncmp("*", nextLinePtr, 1) == 0)
+    while ((strncmp("~", nextLinePtr, 1) == 0)
            || (strncmp("#", nextLinePtr, 1) == 0)
            || (strncmp("$", nextLinePtr, 1) == 0)
            || (strlen(nextLinePtr) == 0));
   }
 
 }
+
 
 #endif

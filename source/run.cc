@@ -29,8 +29,13 @@ int main()
   getcwd(co.run_dir, MAXLINE);
   chdir("-");
 
-  co.iterate(0);
-
+  for(unsigned int i = 0; i < 20; i ++)
+  {
+    std::cout << "ITERATATION : " << i << std::endl;
+    co.iterate(i);
+    co.write_vtk(i);
+    std::cout << co.compute_objective() << std::endl;
+  }
 
   return 0;
 }

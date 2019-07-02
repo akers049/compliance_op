@@ -8,7 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <algorithm>
-
+#include <iomanip>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -33,8 +33,8 @@ namespace Comp_Op
     num_vertex = pow(2, dim);
     num_dofs = num_vertex*dim;
 
-    elmStiffnessMat.resize(num_dofs, std::vector<float> (num_dofs));
-    localToGlobal.resize(num_dofs);
+    elmStiffnessMat.resize(num_dofs, std::vector<float> (num_dofs, 0.0));
+    localToGlobal.resize(num_dofs, -1);
     center.resize(DIM, 0.0);
     float multFactor = 1.0/(1.0*num_vertex);
     for(unsigned int i = 0; i < num_vertex; i ++)
@@ -54,11 +54,14 @@ namespace Comp_Op
                                   std::vector<std::vector<int> > &node_ind_dofs,
                                   std::vector<float> &stiff_values)
   {
+    elmStiffnessMat.resize(num_dofs, std::vector<float> (num_dofs, 0.0));
+    localToGlobal.resize(num_dofs, -1);
+
     unsigned int count = 0;
     for(unsigned int i = 0; i < num_vertex; i ++)
       for(unsigned int k = 0; k < dim_; k ++)
       {
-        localToGlobal[count] = node_ind_dofs[local_inds[i]][k];
+        localToGlobal[count] = node_ind_dofs[local_inds[i] - 1][k];
         count ++;
       }
 
@@ -70,6 +73,7 @@ namespace Comp_Op
 
         if(i != k)
           elmStiffnessMat[i][k] = elmStiffnessMat[k][i];
+
         count ++;
       }
   }
@@ -85,24 +89,40 @@ namespace Comp_Op
     return distance;
   }
 
-  float ElmData::compute_sensitivity(const std::vector<float> &u, float rho_e)
+  float ElmData::compute_sensitivity(const std::vector<float> &u)
   {
-    float sensitivity = 0.0;
+    sensitivity_ = 0.0;
     for(unsigned int i = 0; i < num_dofs; i ++)
       for(unsigned int k = 0; k < num_dofs; k ++)
       {
-        if(localToGlobal[i] == -1 || localToGlobal[k] == -1)
+        if(localToGlobal[i] < 0 || localToGlobal[k] < 0)
           continue;
         else
-          sensitivity += u[localToGlobal[i]]*elmStiffnessMat[i][k]*u[localToGlobal[k]];
+          sensitivity_ += u[localToGlobal[i]]*elmStiffnessMat[i][k]*u[localToGlobal[k]];
       }
 
-    float multFactor = -penal_/rho_e;
-    sensitivity *= multFactor;
+    sensitivity_ *= (-penal_/rho_);
 
-    sensitivity_ = sensitivity;
+    return  sensitivity_;
+  }
 
-    return sensitivity;
+  void ElmData::print_info()
+  {
+    std::cout << "     ELMID : " << elmID << std::endl;
+    std::cout << "     CENTER : " << center[0] << " " << center[1] << std::endl;
+    std::cout << "     SENSITIVITY : " << sensitivity_ << std::endl;
+    std::cout << "     DISP LOCAL : " << std::endl;
+    for(unsigned int i = 0; i < num_dofs; i++)
+      std::cout << "    " << localToGlobal[i] << std::endl;
+    std::cout << "     STIFFNESS MAT LOCAL : " << std::endl;
+    for(unsigned int i = 0; i < num_dofs; i++)
+    {
+      for(unsigned int k = 0; k < num_dofs; k++)
+        std::cout << elmStiffnessMat[i][k] << " ";
+      std::cout << std::endl;
+    }
+    std::cout << "\n";
+
   }
 
   /******************** compliance_opt member functions **********************/
@@ -110,7 +130,7 @@ namespace Comp_Op
   compliance_opt::compliance_opt()
   {
     volFrac = 0.5;
-    rhoMin = 0.0;
+    rhoMin = 0.01;
     penal = 3.0;
 
     density = 1.0;
@@ -118,7 +138,7 @@ namespace Comp_Op
     N = 200;
     N_nodes = 231;
     N_dofs = 440;
-    R_filter = 2.0;
+    R_filter = 0.01;
     V_tot = 0.0;
 
     firstFlag = true;
@@ -158,6 +178,7 @@ namespace Comp_Op
       update_element_vols();
 
     read_displacements();
+
     set_element_stiffness();
     compute_sensitivities();
     filter_sensitivities();
@@ -170,18 +191,35 @@ namespace Comp_Op
       update_rho();
       update_element_rhos();
     }
+
     run_ls_dyna(iter);
     postprocess();
 
     internal_iter++;
 
-    write_vtk(iter);
-    update_rho();
-    update_element_rhos();
-    write_vtk(iter+1);
-
-
     return compute_objective();
+
+  }
+
+  void compliance_opt::run_ls_dyna(const unsigned int iter)
+  {
+    chdir(run_dir);
+    char matFileName[MAXLINE];
+    write_mat_file(iter, matFileName);
+
+    char command[MAXLINE];
+
+    sprintf(command, "cd %s;", iter_dir);
+    strcat(command, "module load bhatta/ls-dyna-double-smp/r1010;");
+
+    char runCommand[MAXLINE];
+    sprintf(runCommand,
+        "/groups/bhatta/software/ls-dyna_smp_d_r1010_x64_redhat5_ifort160/ls-dyna_smp_d_r1010_x64_redhat5_ifort160 i=%s >>ResultOutput.txt",
+        matFileName);
+
+    strcat(command, runCommand);
+
+    system(command);
 
   }
 
@@ -503,28 +541,6 @@ namespace Comp_Op
     chdir("-");
   }
 
-  void compliance_opt::run_ls_dyna(const unsigned int iter)
-  {
-    chdir(run_dir);
-    char matFileName[MAXLINE];
-    write_mat_file(iter, matFileName);
-
-//    char command[MAXLINE];
-//
-//    sprintf(command, "cd %s;", iter_dir);
-//    strcat(command, "module load bhatta/ls-dyna-double-smp/r1010;");
-//
-//    char runCommand[MAXLINE];
-//    sprintf(runCommand,
-//        "/groups/bhatta/software/ls-dyna_smp_d_r1010_x64_redhat5_ifort160/ls-dyna_smp_d_r1010_x64_redhat5_ifort160 i=%s >>ResultOutput.txt",
-//        matFileName);
-//
-//    strcat(command, runCommand);
-//
-//    system(command);
-
-  }
-
   void compliance_opt::write_mat_file(const unsigned int iter, char *matFileName)
   {
     char iter_char[8];
@@ -560,7 +576,7 @@ namespace Comp_Op
     for(unsigned int i = 0; i < N; i ++)
     {
       fprintf(matFile, "*MAT_ELASTIC_TITLE\nelastic%u\n", i);
-      fprintf(matFile, "%10u %9g %9g %9g %9g %9g %9u\n", i+1, density, rho[i], poisson,
+      fprintf(matFile, "%10u %9f %9f %9f %9g %9g %9u\n", ElmDatas[i].elmID , density, (float) pow(ElmDatas[i].rho_, penal), poisson,
                   dummy, dummy, dummy_int);
 
     }
@@ -589,6 +605,9 @@ namespace Comp_Op
 
   void compliance_opt::read_displacements()
   {
+    std::fill(u.begin(), u.end(), 0.0);
+
+
     char dispFileName[MAXLINE];
     strcpy(dispFileName, iter_dir);
     strcat(dispFileName, "/nodout");
@@ -634,14 +653,23 @@ namespace Comp_Op
         exit(-1);
       }
 
+      unsigned int nodeNum;
+      valuesWritten = sscanf(nextLine, "%u", &nodeNum);
+      if(valuesWritten != 1)
+      {
+        std::cout << "Error reading displacement file. Exiting. \n" << std::endl;
+        exit(-1);
+      }
+
+
       for(unsigned int k = 0; k < DIM; k ++)
       {
-        if(node_ind_dofs[i][k] == -1)
+        if(node_ind_dofs[nodeNum - 1][k] == -1)
           continue;
 
         strncpy(tmpch, &(nextLine[10 + k*12]), 12);
         tmpch[12] = '\0';
-        valuesWritten = sscanf(tmpch, "%f", &(u[node_ind_dofs[i][k]]));
+        valuesWritten = sscanf(tmpch, "%f", &(u[node_ind_dofs[nodeNum - 1][k]]));
         if(valuesWritten != 1)
         {
           std::cout << "Error reading displacement file. Exiting. \n" << std::endl;
@@ -669,19 +697,19 @@ namespace Comp_Op
     }
 
     unsigned int num_nodes = pow(2, DIM);
-    std::vector<unsigned int> nextLocalInds(num_nodes);
     char nextLine[MAXLINE];
     int fileEndFlag;
-    char* nodeNums;
-    char* tokPtr;
     unsigned int numStiffnessLines = (DIM*num_nodes*(DIM*num_nodes + 1))/8;
-    std::vector< float > nextStiffnessMat(numStiffnessLines*4);
     for(unsigned int i = 0; i < N; i ++)
     {
+      std::vector<unsigned int> nextLocalInds(num_nodes);
+      std::vector< float > nextStiffnessMat(numStiffnessLines*4);
+      unsigned int elmID;
+
       getNextDataLine(stiffFile, nextLine, MAXLINE, &fileEndFlag, false);
       while(fileEndFlag == false)
       {
-        if(strncmp(nextLine, "  node list", 11) == 0)
+        if(strncmp(nextLine, "Element Id", 10) == 0)
           break;
 
         getNextDataLine(stiffFile, nextLine, MAXLINE, &fileEndFlag, false);
@@ -691,8 +719,35 @@ namespace Comp_Op
         std::cout << "Error 1 reading stiffness file, Exiting.\n" << std::endl;
         exit(1);
       }
-      nodeNums = &nextLine[12];
 
+      char*  elmID_str = &nextLine[11];
+      unsigned int valuesWritten = sscanf(elmID_str, "%u", &elmID);
+      if(valuesWritten != 1)
+      {
+        std::cout << "Error 1 reading stiffness file, Exiting.\n" << std::endl;
+        exit(1);
+      }
+
+
+      for(unsigned int k = 0; k < 4; k ++)
+        getNextDataLine(stiffFile, nextLine, MAXLINE, &fileEndFlag, false);
+
+//      while(fileEndFlag == false)
+//      {
+//        if(strncmp(nextLine, "  node list", 11) == 0)
+//          break;
+//
+//        getNextDataLine(stiffFile, nextLine, MAXLINE, &fileEndFlag, false);
+//      }
+//      if(fileEndFlag == true)
+//      {
+//        std::cout << "Error 1 reading stiffness file, Exiting.\n" << std::endl;
+//        exit(1);
+//      }
+
+      char* nodeNums = &nextLine[12];
+
+      char* tokPtr;
       for(unsigned int k = 0; k < num_nodes; k ++)
       {
         if(k == 0)
@@ -700,13 +755,12 @@ namespace Comp_Op
         else
           tokPtr = strtok(NULL, " ");
 
-        unsigned int valuesWritten = sscanf(tokPtr, "%u", &(nextLocalInds[k]));
+        valuesWritten = sscanf(tokPtr, "%u", &(nextLocalInds[k]));
         if(valuesWritten != 1)
         {
           std::cout << "Error 2 reading stiffness file. Exiting \n" << std::endl;
           exit(-1);
         }
-        nextLocalInds[k]--;
       }
 
       // line that just says "Element Matrix"
@@ -737,8 +791,21 @@ namespace Comp_Op
 
       }
 
-      ElmDatas[i].set_elm_stiffness(nextLocalInds, node_ind_dofs,
-          nextStiffnessMat);
+      bool foundFlag = false;
+      for(unsigned int k = 0; k < N; k ++)
+      {
+        if(ElmDatas[k].elmID == elmID)
+        {
+         foundFlag = true;
+         ElmDatas[k].set_elm_stiffness(nextLocalInds, node_ind_dofs,
+            nextStiffnessMat);
+        }
+      }
+      if(foundFlag == false)
+      {
+        std::cout << "Error 6 reading stiffness file. Exiting \n" << std::endl;
+        exit(-1);
+      }
 
     }
 
@@ -746,16 +813,16 @@ namespace Comp_Op
 
   void compliance_opt::compute_sensitivities()
   {
-    set_element_stiffness();
 
     std::fill(sensitivities.begin(), sensitivities.end(), 0.0);
     for(unsigned int i = 0; i < N; i ++)
-      sensitivities[i] = ElmDatas[i].compute_sensitivity(u, rho[i]);
+      sensitivities[i] = ElmDatas[i].compute_sensitivity(u);
 
   }
 
   void compliance_opt::filter_sensitivities()
   {
+    std::fill(sensitivities_filtered.begin(), sensitivities_filtered.end(), 0.0);
 
     for(unsigned int i = 0; i < N ; i ++)
     {
@@ -773,26 +840,29 @@ namespace Comp_Op
 
   void compliance_opt::update_rho()
   {
-    float l1 = 0;
-    float l2 = 100000;
-    float move = 0.2;
+    double l1 = 0.0;
+    double l2 = 100000.0;
+    double move = 0.2;
     std::vector<float> rho_new(N, 0.0);
-    while (l2-l1 > 1e-4)
+    float V = 0.0;
+    while ((l2-l1) > 1e-4)
     {
-      float lmid = 0.5*(l2+l1);
+      double lmid = 0.5*(l2+l1);
       for(unsigned int i = 0; i < N; i ++)
-        rho_new[i] =std::max(rhoMin,(float) std::max(rho[i] - move,(float) std::min((float) 1.0,(float) std::min((float) (rho[i] + move),(float) (rho[i]*sqrt(-sensitivities_filtered[i]/lmid))))));
+        rho_new[i] = std::max((double) rhoMin, std::max(rho[i] - move,
+             std::min( 1.0,std::min( (rho[i] + move),
+                 (rho[i]*sqrt(-sensitivities_filtered[i]/lmid))))));
 
-      float V = 0.0;
-
+      V = 0.0;
       for(unsigned int i = 0; i < N; i ++)
         V += rho_new[i]*ElmDatas[i].volume_;
 
-      if (V - volFrac*V_tot > 0.0)
+      if ((V - volFrac*V_tot) > 0.0)
         l1 = lmid;
       else
         l2 = lmid;
     }
+    std::cout << "Volume : " << V << std::endl;
 
     rho = rho_new;
   }
@@ -901,8 +971,6 @@ namespace Comp_Op
 
     }
 
-
-
   }
 
   void compliance_opt::write_vtk(unsigned int iter)
@@ -967,6 +1035,12 @@ namespace Comp_Op
     for(unsigned int i = 0; i < N; i++)
       fprintf(vtkFile, " %f", ElmDatas[i].rho_);
     fprintf(vtkFile, "\n");
+    fprintf(vtkFile, "SCALARS sensitivity float\n");
+    fprintf(vtkFile, "LOOKUP_TABLE default\n");
+    for(unsigned int i = 0; i < N; i++)
+      fprintf(vtkFile, " %f", sensitivities[i]);
+    fprintf(vtkFile, "\n");
+
     fclose(vtkFile);
   }
 

@@ -27,17 +27,18 @@ class ElmData
      void set_elm_stiffness(std::vector<unsigned int> &local_inds,
                        std::vector<std::vector<int> > &node_ind_dofs,
                        std::vector<float> &stiff_values);
-     float compute_sensitivity(const std::vector<float> &u, float rho_e);
+     float compute_sensitivity(const std::vector<float> &u);
      void add_neighbor( ElmData* nextElm, float dist)
        {neighborList.push_back(std::make_pair(nextElm, dist));}
      float dist(ElmData* otherElm);
      void update_rho(float rho_new){rho_ = rho_new;}
      void set_vol(float vol){volume_ = vol;};
+     void print_info();
 
      std::vector< std::pair<ElmData*, float> > neighborList;
-     std::vector<unsigned int> localToGlobal;
+     std::vector<int> localToGlobal;
      std::vector< std::vector<float> > elmStiffnessMat;
-     std::vector<std::vector <float> > nodePos;
+     std::vector< std::vector<float> > nodePos;
      std::vector< float > center;
      std::vector< unsigned int > node_indicies;
 
@@ -85,12 +86,12 @@ class ElmData
                           int const maxSize, int* const endOfFileFlag,
                           bool trimFlag = true);
 
-    float compute_objective(){return u[node_ind_dofs[220][1]]; }
+    float compute_objective(){return -u[node_ind_dofs[220][1]]; }
 
     std::vector<float> rho;
     std::vector<float> old_rho;
-    std::vector<float> sensitivities;
-    std::vector<float> sensitivities_filtered;
+    std::vector<double> sensitivities;
+    std::vector<double> sensitivities_filtered;
 
     std::vector<float> u;
     std::vector<std::vector<int> > node_ind_dofs;

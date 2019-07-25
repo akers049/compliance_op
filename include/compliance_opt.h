@@ -8,6 +8,9 @@
 #include <math.h>
 #include <vector>
 #include <cstdlib>
+#include <Eigen/Sparse>
+#include <Eigen/UmfPackSupport>
+#include <Eigen/SparseExtra>
 
 #define DIM 2
 
@@ -15,7 +18,11 @@
 
 namespace Comp_Op
 {
-class ElmData
+
+  void getNextDataLine( FILE* const filePtr, char* nextLinePtr,
+                        int const maxSize, int* const endOfFileFlag, bool trimFlag = true);
+
+  class ElmData
   {
 
   public:
@@ -28,6 +35,8 @@ class ElmData
                        std::vector<std::vector<int> > &node_ind_dofs,
                        std::vector<float> &stiff_values);
      float compute_sensitivity(const std::vector<float> &u);
+     float compute_elm_compliance(const std::vector<float> &u);
+     double compute_elm_compliance_dynamic(const std::vector<double> &u);
      void add_neighbor( ElmData* nextElm, float dist)
        {neighborList.push_back(std::make_pair(nextElm, dist));}
      float dist(ElmData* otherElm);
@@ -52,15 +61,48 @@ class ElmData
      unsigned int num_dofs;
   };
 
+  class TimeHistory
+  {
+  public:
+    TimeHistory(unsigned int nnodes, unsigned int ndofs, std::vector< std::vector<int> >  &node_ind);
+    ~TimeHistory(){clear_lambda_data();};
+
+    void read_data(char *nodoutFile);
+    void clear_lambda_data()
+    {
+      for(unsigned int i = 0; i < lambda.size(); i ++)
+        {
+          free(lambda[i]);
+          lambda.clear();
+          lambda_time.clear();
+        }
+
+    };
+
+    unsigned int N_nodes;
+    unsigned int N_dofs;
+    std::vector< std::vector<int> > *node_ind_dofs;
+
+    std::vector<double> t;
+    std::vector< std::vector<double> > u;
+    std::vector< std::vector<double> > v;
+    std::vector< std::vector<double> > a;
+
+    std::vector< double* > lambda;
+    std::vector< double >  lambda_time;
+
+    unsigned int numSteps;
+  };
+
   class compliance_opt
   {
 
   public:
     compliance_opt();
-    ~compliance_opt(){};
+    ~compliance_opt(){delete timeHistory;};
 
     void initialize(char* static_dir);
-    float iterate(unsigned int iter);
+    float iterate(unsigned int iter, bool dakota = false);
     void postprocess();
     void update_rho();
     void read_input_file(char* fileName);
@@ -76,17 +118,34 @@ class ElmData
 
     void compute_sensitivities();
     void filter_sensitivities();
+    void set_stiffness_matrix();
+    void set_mass_matrix();
+    void read_mass_matrix();
+    void compute_hessian();
 
     void update_element_vols();
     void update_element_rhos();
     void update_element_neighbors();
+
+    void integrate_dynamic_lambda();
+    void compute_dynamic_dhdrho();
+    void integrate_dynamic_sensitivity();
+    float compute_dynamic_objective();
+
+
     void write_vtk(unsigned int iter);
 
-    void getNextDataLine( FILE* const filePtr, char* nextLinePtr,
-                          int const maxSize, int* const endOfFileFlag,
-                          bool trimFlag = true);
+//    void getNextDataLine( FILE* const filePtr, char* nextLinePtr,
+//                          int const maxSize, int* const endOfFileFlag,
+//                          bool trimFlag = true);
 
-    float compute_objective(){return -u[node_ind_dofs[220][1]]; }
+    float compute_objective();
+
+    void write_dakota_input(char *static_dir);
+    unsigned int read_dakota_param_input();
+    void write_dakota_param_output();
+
+    TimeHistory *timeHistory;
 
     std::vector<float> rho;
     std::vector<float> old_rho;
@@ -99,9 +158,16 @@ class ElmData
     std::vector<unsigned int > fixedNodes;
     std::vector<std::vector<float> > node_pos;
 
+    Eigen::SparseMatrix<double> K;
+    Eigen::SparseMatrix<double> M;
+    std::vector<std::vector<double> > hessian;
+    std::map< std::pair<unsigned int, unsigned int>, std::vector<double> > dh_drho;
+    std::vector< std::vector<unsigned int> > dh_drho_indicies;
+
     char ls_static_dir[MAXLINE];
     char run_dir[MAXLINE];
     char iter_dir[MAXLINE];
+    char dynamic_init_dir[MAXLINE];
 
     float R_filter;
     float volFrac;
@@ -114,10 +180,17 @@ class ElmData
     float V_tot;
 
     bool firstFlag;
+    bool dynamicFlag;
 
     unsigned int N;
     unsigned int N_nodes;
     unsigned int N_dofs;
+
+    float compliance;
+
+    double F_max;
+    double T_max;
+    std::vector<unsigned int> forcedDofs;
 
   private:
     unsigned int internal_iter = 0;

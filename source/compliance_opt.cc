@@ -16,9 +16,11 @@
 #include <cmath>
 #include <unistd.h>
 
+#include <gsl/gsl_poly.h>
 #include <gsl/gsl_errno.h>
 #include <gsl/gsl_matrix.h>
 #include <gsl/gsl_odeiv2.h>
+#include <time.h>
 
 double interpolate( std::vector<double> &xData, std::vector<double> &yData, double x, bool extrapolate )
 {
@@ -192,6 +194,7 @@ namespace Comp_Op
 
   void TimeHistory::read_data(char *nodoutFile)
   {
+    double maxVal = 0.0;
     numSteps = 0;
     u.clear();
     v.clear();
@@ -206,10 +209,13 @@ namespace Comp_Op
       exit(1);
     }
 
+    clock_t timer = clock();
+
     int dummy;
     std::vector<int> tmp(DIM);
     char nextLine[MAXLINE];
     unsigned int count = 0;
+    char *nextDataString;
     getNextDataLine(dispFile, nextLine, MAXLINE, &dummy, false);
     while(dummy == 0)
     {
@@ -225,7 +231,7 @@ namespace Comp_Op
           a.push_back(std::vector<double> (N_dofs, 0.0));
           t.push_back(0.0);
 
-          std::vector<float> nextVals(9);
+          std::vector<double> nextVals(9);
           unsigned int nextNodeNumber;
 
           // save time
@@ -243,17 +249,65 @@ namespace Comp_Op
             getNextDataLine(dispFile, nextLine, MAXLINE, &dummy, true); //blank lines
 
             // read data and node number
-            valuesWritten = sscanf(nextLine, "%u %f %f %f %f %f %f %f %f %f",
-                &nextNodeNumber, &(nextVals[0]), &(nextVals[1]), &(nextVals[2]),
-                                 &(nextVals[3]), &(nextVals[4]), &(nextVals[5]),
-                                 &(nextVals[6]), &(nextVals[7]), &(nextVals[8]));
+//            valuesWritten = sscanf(nextLine, "%u %lf %lf %lf %lf %lf %lf %lf %lf %lf",
+//                &nextNodeNumber, &(nextVals[0]), &(nextVals[1]), &(nextVals[2]),
+//                                 &(nextVals[3]), &(nextVals[4]), &(nextVals[5]),
+//                                 &(nextVals[6]), &(nextVals[7]), &(nextVals[8]));
+//            if(valuesWritten != 10)
+//            {
+//              std::cout << "Error reading the time history data. Exiting.\n";
+//              exit(-1);
+//            }
 
-            if(valuesWritten != 10)
+            valuesWritten = sscanf(nextLine, "%u", &nextNodeNumber);
+            if(valuesWritten != 1)
             {
               std::cout << "Error reading the time history data. Exiting.\n";
               exit(-1);
             }
 
+            nextDataString = &nextLine[10];
+            for(unsigned int j = 0; j < 8; j ++)
+            {
+              if(nextDataString[8] == 'E')
+              {
+                valuesWritten = sscanf(nextDataString, "%lf", &(nextVals[j]));
+                if(valuesWritten != 1)
+                {
+                  std::cout << "Error reading the time history data. Exiting.\n";
+                  exit(-1);
+                }
+              }
+              else
+                nextVals[j] = 0.0;
+
+              nextDataString = &(nextDataString[12]);
+            }
+            if(nextDataString[8] == 'E')
+            {
+              valuesWritten = sscanf(nextDataString, "%lf", &(nextVals[8]));
+              if(valuesWritten != 1)
+              {
+                std::cout << "Error reading the time history data. Exiting.\n";
+                exit(-1);
+              }
+            }
+            else
+              nextVals[8] = 0.0;
+
+
+            for(unsigned int j = 0; j < 9; j ++)
+            {
+              if(fabs(nextVals[j]) < 1e-15)
+                nextVals[j] = 0.0;
+
+              if(numSteps == 3)
+              {
+                if(fabs(nextVals[j]) > maxVal)
+                  maxVal = fabs(nextVals[j]);
+              }
+
+            }
             for(unsigned int j = 0; j < DIM; j ++)
             {
               if((*node_ind_dofs)[nextNodeNumber -1][j] == -1)
@@ -278,8 +332,12 @@ namespace Comp_Op
       exit(-1);
     }
 
+    timer = clock() - timer;
+
     fclose(dispFile);
-    std::cout << "Sucessfully read in time history file. \n";
+    std::cout << "  Sucessfully read in time history file with " << numSteps << " timesteps.\n";
+    std::cout << "    Elapsed time to read history file : " << ((float)timer)/CLOCKS_PER_SEC << " seconds.\n";
+    std::cout << "    MAX VAL : " << maxVal << std::endl;
 
   }
 
@@ -313,6 +371,32 @@ namespace Comp_Op
 
     volume_ = 1.0;
     node_indicies = nodeIds;
+    sensitivity_ = 0.0;
+    t = 0.0;
+    E_ = 0.0;
+    dE_drho_ = 0.0;
+  }
+
+  void ElmData::update_rho(float rho_new, double k1, double k2)
+  {
+    rho_ = rho_new;
+
+    double a = -3.0*(1.0 - k2)/(k1 - k2);
+    double b = -a;
+    double c = -rho_;
+
+    double roots[3];
+    int numRoots = gsl_poly_solve_cubic(a, b, c, &roots[0], &roots[1], &roots[2]);
+    for(unsigned int i = 0; i < numRoots; i++)
+      if(roots[i] >= 0.0 && roots[i] <= 1.0)
+      {
+        t = roots[i];
+        break;
+      }
+    double t_sq = t*t;
+    E_ = k1*(a*t_sq + b*t) + t_sq*t;
+
+    dE_drho_ = (k1*b*(1.0 - 2.0*t) + 3.0*t_sq)/(b*(1.0 - 2.0*t) + 3.0*t_sq);
 
   }
 
@@ -381,7 +465,7 @@ namespace Comp_Op
         if(localToGlobal[i] < 0 || localToGlobal[k] < 0)
           continue;
         else
-          elm_compliance_dub += pow(rho_, penal_)*u[localToGlobal[i]]*elmStiffnessMat[i][k]*u[localToGlobal[k]];
+          elm_compliance_dub += E_*u[localToGlobal[i]]*elmStiffnessMat[i][k]*u[localToGlobal[k]];
       }
 
     return elm_compliance_dub;
@@ -426,19 +510,141 @@ namespace Comp_Op
 
   compliance_opt::compliance_opt()
   {
-    volFrac = 0.5;
-    rhoMin = 0.01;
-    penal = 3.0;
+    volFrac = 0.0;
+    rhoMin = 0.0;
+    penal = 0.0;
 
-    density = 1.0;
-    poisson = 0.3;
-    N = 200;
-    N_nodes = 231;
-    N_dofs = 440;
-    R_filter = 0.01;
+    density = 0;
+    poisson = 0;
+    N = 0;
+    N_nodes = 0;
+    N_dofs = 0;
+    R_filter = 0.0;
+
     V_tot = 0.0;
 
     firstFlag = true;
+
+
+    compliance = 0.0;
+
+    T_max = 0.0;
+    F_max = 0.0;
+    timeHistory = NULL;
+
+    internal_iter = 0;
+    dynamicFlag = true;
+
+    k1 = 1.0/3.0;
+    k2 = 3.0;
+    change = 10000;
+
+    numIntegrationSteps = 100;
+    cleanFlag = true;
+  }
+
+  void compliance_opt::read_input_file(char* fileName)
+  {
+    FILE* fid;
+    int endOfFileFlag;
+    char nextLine[MAXLINE];
+
+    int valuesWritten;
+    bool fileReadErrorFlag = false;
+    unsigned int dummy;
+
+
+    fid = std::fopen(fileName, "r");
+    if (fid == NULL)
+    {
+      std::cout << "Unable to open file \"" << fileName  << "\"" <<  std::endl;
+      fileReadErrorFlag = true;
+    }
+    else
+    {
+
+      // Read in the number of elements, number of nodes, and number of dofs
+      getNextDataLine(fid, nextLine, MAXLINE, &endOfFileFlag);
+      valuesWritten = sscanf(nextLine, "%u %u %u", &N, &N_nodes, &N_dofs);
+      if (valuesWritten != 3)
+      {
+        fileReadErrorFlag = true;
+        goto fileClose;
+      }
+
+      // read in the density and poisson ratio
+      getNextDataLine(fid, nextLine, MAXLINE, &endOfFileFlag);
+      valuesWritten = sscanf(nextLine, "%f %f", &density, &poisson);
+      if(valuesWritten != 2)
+      {
+        fileReadErrorFlag = true;
+        goto fileClose;
+      }
+
+      // read in constrained volume fraction, the minimum rho, the filter
+      // radius, and the penalization factor.
+      getNextDataLine(fid, nextLine, MAXLINE, &endOfFileFlag);
+      valuesWritten = sscanf(nextLine, "%f %f %f %lf", &volFrac, &rhoMin, &R_filter, &penal);
+      if(valuesWritten != 4)
+      {
+        fileReadErrorFlag = true;
+        goto fileClose;
+      }
+
+      //reading forcing info: T_max and F_max
+      getNextDataLine(fid, nextLine, MAXLINE, &endOfFileFlag);
+      valuesWritten = sscanf(nextLine, "%lf %lf", &T_max, &F_max);
+      if(valuesWritten != 2)
+      {
+        fileReadErrorFlag = true;
+        goto fileClose;
+      }
+
+      // read in the forced dof
+      getNextDataLine(fid, nextLine, MAXLINE, &endOfFileFlag);
+      valuesWritten = sscanf(nextLine, "%u", &dummy);
+      if(valuesWritten != 1)
+      {
+        fileReadErrorFlag = true;
+        goto fileClose;
+      }
+      forcedDofs.push_back(dummy);
+
+      // read in k1 and k2 for dynamics
+      getNextDataLine(fid, nextLine, MAXLINE, &endOfFileFlag);
+      valuesWritten = sscanf(nextLine, "%lf %lf", &k1, &k2);
+      if(valuesWritten != 2)
+      {
+        std::cout << "k1 and k2 not set. Using default values of 1/3 and 3, respectively. \n";
+      }
+
+      // read in the number of integration steps for dynamics
+      getNextDataLine(fid, nextLine, MAXLINE, &endOfFileFlag);
+      valuesWritten = sscanf(nextLine, "%u", &numIntegrationSteps);
+      if(valuesWritten != 1)
+      {
+        std::cout << "Number of integration steps not set. Using default value of 100.\n";
+      }
+
+
+      fileClose:
+      {
+        fclose(fid);
+      }
+    }
+
+    if (fileReadErrorFlag)
+    {
+      // default parameter values
+      std::cout << "  Error reading input file, Exiting.\n" << std::endl;
+      exit(1);
+    }
+    else
+      std::cout << "  Input file successfully read" << std::endl;
+  }
+
+  void compliance_opt::initialize(char* static_dir)
+  {
 
     node_ind_dofs.resize(N_nodes, std::vector<int>(DIM));
     node_pos.resize(N_nodes, std::vector<float>(DIM));
@@ -449,31 +655,15 @@ namespace Comp_Op
 
     rho.resize(N);
     std::fill(rho.begin(), rho.end(), volFrac);
-
-    compliance = 0.0;
-
-    T_max = 200.0;
-    F_max = 0.02;
-    forcedDofs.push_back(419);
-    timeHistory = NULL;
     K.resize(N_dofs, N_dofs);
     M.resize(N_dofs, N_dofs);
 
-    dynamicFlag = true;
-
-
-  }
-
-  void compliance_opt::initialize(char* static_dir)
-  {
     char currentDir[MAXLINE];
      getcwd(currentDir, MAXLINE);
 
     chdir(static_dir);
     getcwd(ls_static_dir, MAXLINE);
-   // int worked = chdir(run_dir);
 
-   // getcwd(currentDir, MAXLINE);
 
     read_node_data();
 
@@ -492,48 +682,44 @@ namespace Comp_Op
   {
     // just gotta do this once
     if(internal_iter == 0)
+    {
       update_element_vols();
+    }
 
     if(!dynamicFlag)
+    {
+      set_element_stiffness();
       read_displacements();
+      compute_sensitivities();
+      compute_objective();
+    }
     else
     {
+      set_stiffness_matrix();
+      set_mass_matrix();
+
       char dispFileName[MAXLINE];
       strcpy(dispFileName, iter_dir);
       strcat(dispFileName, "/nodout");
       timeHistory->read_data(dispFileName);
       integrate_dynamic_lambda();
-    }
-
-
-    if(internal_iter == 0)
-      set_element_stiffness();
-
-    set_stiffness_matrix();
-    set_mass_matrix();
-
-    if(!dynamicFlag)
-    {
-      compute_sensitivities();
-      filter_sensitivities();
-      compute_objective();
-    }
-    else
-    {
       compute_dynamic_dhdrho();
       integrate_dynamic_sensitivity();
       compute_dynamic_objective();
     }
+
+    filter_sensitivities();
+
   }
 
   float compliance_opt::iterate(unsigned int iter, bool dakota)
   {
+    char nextDir[MAXLINE];
+
     if(dakota == false)
     {
       char iter_char[8];
       sprintf(iter_char, "%u", iter);
-
-      char nextDir[MAXLINE];
       strcpy(nextDir, "iter_");
       strcat(nextDir, iter_char);
 
@@ -556,8 +742,17 @@ namespace Comp_Op
     write_vtk(iter);
 
     if(dakota == false)
+    {
       chdir("..");
 
+      if(cleanFlag)
+      {
+        char rmCommand[MAXLINE];
+        strcpy(rmCommand, "rm -r ");
+        strcat(rmCommand, nextDir);
+        system(rmCommand);
+      }
+    }
     internal_iter++;
 
     return compliance;
@@ -737,7 +932,7 @@ namespace Comp_Op
       }
       fclose(infoFile);
 
-      std::cout << "Sucessfully read node file.\n";
+      std::cout << "  Sucessfully read node file.\n";
 
 
     }
@@ -784,9 +979,13 @@ namespace Comp_Op
     {
       fileReadErrorFlag = true;
     }
+    unsigned int count = 0;
     while(fileEndFlag == false && fileReadErrorFlag == false)
     {
-
+      if(count != eid - 1)
+      {
+        std::cout << "Element with eid :  " << eid << " not found in " << count << " position." << std::endl;
+      }
       ElmDatas.push_back(ElmData(DIM, penal, eid, n, node_pos));
       fprintf(fid_w, "%8u%8u%8u%8u%8u%8u%8u%8u%8u%8u\n",
         eid, eid, n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7]);
@@ -799,6 +998,7 @@ namespace Comp_Op
         fileReadErrorFlag = true;
         break;
       }
+      count ++;
     }
     fprintf(fid_w, "*END");
 
@@ -807,14 +1007,11 @@ namespace Comp_Op
 
     if (fileReadErrorFlag)
     {
-      std::cout << "Error reading file, Exiting.\n" << std::endl;
+      std::cout << "  Error reading file, Exiting.\n" << std::endl;
       exit(1);
     }
     else
-     std::cout << "Successfully wrote element file" << std::endl;
-
-
-    std::cout << "Element File Sucessfully Written\n";
+     std::cout << "  Successfully wrote element file" << std::endl;
 
 
     chdir(run_dir);
@@ -839,7 +1036,7 @@ namespace Comp_Op
     {
       fprintf(fid_w, "*PART\nplate%u\n", i+1);
 
-      fprintf(fid_w, "%10u%10u%10u\n",
+      fprintf(fid_w, "%10u%10u%10u         0         1\n",
                        i+1, 1, i+1);
     }
 
@@ -856,7 +1053,7 @@ namespace Comp_Op
     fprintf(fid_w, "*END");
     fclose(fid_w);
 
-    std::cout << "Part File Sucessfully Written\n";
+    std::cout << "  Part File Sucessfully Written\n";
 
     chdir(run_dir);
   }
@@ -870,8 +1067,6 @@ namespace Comp_Op
     strcpy(matFileName, "ls_mat_");
     strcat(matFileName, iter_char);
     strcat(matFileName, ".k");
-
-
 
     FILE* matFile;
     matFile = fopen(matFileName, "w");
@@ -889,10 +1084,10 @@ namespace Comp_Op
     {
       fprintf(matFile, "*MAT_ELASTIC_TITLE\nelastic%u\n", i);
       if(dynamicFlag)
-        fprintf(matFile, "%10u %9f %9f %9f %9g %9g %9u\n", ElmDatas[i].elmID , ElmDatas[i].rho_, (float) pow(ElmDatas[i].rho_, penal), poisson,
+        fprintf(matFile, "%10u %9f %9f %9f %9g %9g %9u\n", ElmDatas[i].elmID , (ElmDatas[i].rho_)*density, ElmDatas[i].E_, poisson,
                   dummy, dummy, dummy_int);
       else
-        fprintf(matFile, "%10u %9f %9f %9f %9g %9g %9u\n", ElmDatas[i].elmID , density, (float) pow(ElmDatas[i].rho_, penal), poisson,
+        fprintf(matFile, "%10u %9f %9f %9f %9g %9g %9u\n", ElmDatas[i].elmID , 1.0, (float) pow(ElmDatas[i].rho_, penal), poisson,
                   dummy, dummy, dummy_int);
 
     }
@@ -918,7 +1113,7 @@ namespace Comp_Op
 
     fclose(matFile);
 
-    std::cout << "Mat file " << matFileName << " successfully written\n";
+    std::cout << "  Mat file " << matFileName << " successfully written\n";
 
   }
 
@@ -999,7 +1194,7 @@ namespace Comp_Op
       }
     }
     fclose(dispFile);
-    std::cout << "Sucessfully read in displacement file. \n";
+    std::cout << "  Sucessfully read in displacement file. \n";
 
   }
 
@@ -1056,19 +1251,6 @@ namespace Comp_Op
 
       for(unsigned int k = 0; k < 4; k ++)
         getNextDataLine(stiffFile, nextLine, MAXLINE, &fileEndFlag, false);
-
-//      while(fileEndFlag == false)
-//      {
-//        if(strncmp(nextLine, "  node list", 11) == 0)
-//          break;
-//
-//        getNextDataLine(stiffFile, nextLine, MAXLINE, &fileEndFlag, false);
-//      }
-//      if(fileEndFlag == true)
-//      {
-//        std::cout << "Error 1 reading stiffness file, Exiting.\n" << std::endl;
-//        exit(1);
-//      }
 
       char* nodeNums = &nextLine[12];
 
@@ -1200,7 +1382,7 @@ namespace Comp_Op
 
       M.resize(N_dofs, N_dofs);
       M.setFromTriplets(coefficients.begin(), coefficients.end());
-      std::cout << "Sucessfully set the mass matrix. \n";
+      std::cout << "  Sucessfully set the mass matrix. \n";
 
     }
 
@@ -1239,9 +1421,9 @@ namespace Comp_Op
       for(unsigned int i = 0; i < forcedDofs.size(); i ++)
         compliance_history[k] += timeHistory->u[k][forcedDofs[i]]*loadingFunction( -timeHistory->t[k], F_max, T_max);
 
-      std::cout << loadingFunction( -timeHistory->t[k], F_max, T_max) <<  "   " << timeHistory->u[k][forcedDofs[0]]  << " " << forcedDofs.size() <<std::endl;
-
-      std::cout << "     " << compliance_history[k] << std::endl;
+//      std::cout << loadingFunction( -timeHistory->t[k], F_max, T_max) <<  "   " << timeHistory->u[k][forcedDofs[0]]  << " " << forcedDofs.size() <<std::endl;
+//
+//      std::cout << "     " << compliance_history[k] << std::endl;
     }
 
     for(unsigned int i = 0; i < timeHistory->numSteps - 1; i ++)
@@ -1250,38 +1432,51 @@ namespace Comp_Op
                           *(timeHistory->t[i + 1] - timeHistory->t[i]);
     }
 
-    std::cout << "we in dis bitch \n" << timeHistory->numSteps << std::endl;;
+//    std::cout << "we in dis bitch \n" << timeHistory->numSteps << std::endl;;
 
 
     // check dynamics...
-    double dynamicsWorks = 0.0;
-    for(unsigned int k = 0; k < timeHistory->numSteps; k ++)
-    {
-      std::vector<double> nextStuff(N_dofs, 0.0);
+//    double dynamicsWorks;
+//    for(unsigned int k = 0; k < timeHistory->numSteps; k ++)
+//    {
+//      double dynamicsWorks_k = 0.0;
+//      std::vector<double> nextStuff(N_dofs, 0.0);
+//
+//      for (unsigned int i = 0; i < M.outerSize(); ++i)
+//        for (Eigen::SparseMatrix<double>::InnerIterator it(M,i); it; ++it)
+//        {
+//          nextStuff[it.col()] += (timeHistory->a[k][it.col()])*(it.value());
+//        }
+//
+//      for (unsigned int i = 0; i < K.outerSize(); ++i)
+//        for (Eigen::SparseMatrix<double>::InnerIterator it(K,i); it; ++it)
+//        {
+//          nextStuff[it.row()] += it.value()*timeHistory->u[k][it.col()];
+//        }
+//
+//      nextStuff[forcedDofs[0]] -= loadingFunction( -timeHistory->t[k], F_max, T_max);
+////      std::cout << " time : " << timeHistory->t[k] << "   load : " << loadingFunction( -timeHistory->t[k], F_max, T_max) <<
+////          "     " << timeHistory->a[k][forcedDofs[0]] << std::endl;
+////      std::cout << "     : " << nextStuff[forcedDofs[0]] << "   " << nextStuff[forcedDofs[0] + 1] << std::endl;
+//
+//      for(unsigned int l = 0; l <N_dofs; l ++)
+//        dynamicsWorks_k += fabs(nextStuff[l]);
+//
+////      std::cout << k <<  "  " << dynamicsWorks_k << std::endl;
+//      dynamicsWorks += dynamicsWorks_k;
+//    }
+////
+//    std::cout << "dynamics dont work : " << dynamicsWorks << std::endl;
 
-      for (unsigned int i = 0; i < M.outerSize(); ++i)
-        for (Eigen::SparseMatrix<double>::InnerIterator it(M,i); it; ++it)
-        {
-          nextStuff[it.col()] += (timeHistory->a[k][it.col()])*(it.value());
-        }
 
-      for (unsigned int i = 0; i < K.outerSize(); ++i)
-        for (Eigen::SparseMatrix<double>::InnerIterator it(K,i); it; ++it)
-        {
-          nextStuff[it.row()] += it.value()*timeHistory->u[k][it.col()];
-        }
+    for (unsigned int i = 0; i < M.outerSize(); ++i)
+      for (Eigen::SparseMatrix<double>::InnerIterator it(M,i); it; ++it)
+      {
+        if(it.col() != it.row())
+          std::cout << "   MASS MATRIX PROBLEM : " << it.row() << "  " << it.col();
 
-      nextStuff[forcedDofs[0]] -= loadingFunction( -timeHistory->t[k], F_max, T_max);
-      std::cout << " time : " << timeHistory->t[k] << "   load : " << loadingFunction( -timeHistory->t[k], F_max, T_max) <<
-          "     " << timeHistory->a[k][forcedDofs[0]] << std::endl;
-      std::cout << "     : " << nextStuff[forcedDofs[0]] << "   " << nextStuff[forcedDofs[0] + 1] << std::endl;
+      }
 
-      for(unsigned int l = 0; l <N_dofs; l ++)
-        dynamicsWorks += fabs(nextStuff[l]);
-
-    }
-
-    std::cout << "dynamics dont work : " << dynamicsWorks << std::endl;
 
     return compliance;
   }
@@ -1298,11 +1493,12 @@ namespace Comp_Op
   void compliance_opt::set_stiffness_matrix()
   {
     K.setZero();
+    K.data().squeeze();
 
     std::vector<Eigen::Triplet<double> > coefficients;
     for(unsigned int i =0 ; i < N; i ++)
     {
-      float nextScaleFactor = pow(ElmDatas[i].rho_, penal);
+      double nextScaleFactor = 1.0*ElmDatas[i].E_;
       for(unsigned int a = 0; a < ElmDatas[i].num_dofs; a++)
       {
         if(ElmDatas[i].localToGlobal[a] == -1)
@@ -1323,16 +1519,18 @@ namespace Comp_Op
     }
     K.setFromTriplets(coefficients.begin(), coefficients.end());
 
+    std::cout << "  Set global stiffness matrix for iteration " << internal_iter << std::endl;
   }
 
   void compliance_opt::set_mass_matrix()
   {
     M.setZero();
+    M.data().squeeze();
     std::vector<Eigen::Triplet<double> > coefficients;
 
     for(unsigned int i =0 ; i < N; i ++)
     {
-      double nextMass = ElmDatas[i].volume_*ElmDatas[i].rho_/(pow(2.0, DIM));
+      double nextMass = 1.0*(density*ElmDatas[i].volume_*ElmDatas[i].rho_/(pow(2.0, DIM)));
       for(unsigned int a = 0; a < ElmDatas[i].num_dofs; a++)
       {
         if(ElmDatas[i].localToGlobal[a] == -1)
@@ -1342,11 +1540,12 @@ namespace Comp_Op
             Eigen::Triplet<double> (ElmDatas[i].localToGlobal[a],
                                     ElmDatas[i].localToGlobal[a],
                                     nextMass));
-
       }
     }
 
     M.setFromTriplets(coefficients.begin(), coefficients.end());
+    std::cout << "  Set global mass matrix for iteration " << internal_iter << std::endl;
+
   }
 
 
@@ -1437,14 +1636,26 @@ namespace Comp_Op
       {
         float nextH = R_filter - ((ElmDatas[i]).neighborList)[k].second;
         H_tot += nextH;
-        sensitivities_filtered[i] += nextH*ElmDatas[i].rho_*ElmDatas[i].sensitivity_;
+        sensitivities_filtered[i] += nextH*(ElmDatas[i].neighborList)[k].first->rho_*(ElmDatas[i].neighborList)[k].first->sensitivity_;
       }
       sensitivities_filtered[i] *= (1.0/(ElmDatas[i].rho_*H_tot));
+//      if(sensitivities_filtered[i] > 0.0)
+//        sensitivities_filtered[i] = 0.0;
     }
+
+    std::vector<double>::iterator maxIt;
+    maxIt = std::max_element(sensitivities_filtered.begin(), sensitivities_filtered.end());
+    double maxVal =  *maxIt;
+    if(maxVal > 0.0)
+      for(unsigned int beta = 0; beta < N; beta++)
+        sensitivities_filtered[beta] -= maxVal;
+
   }
 
   void compliance_opt::integrate_dynamic_lambda()
   {
+
+    clock_t timer = clock();
 
     timeHistory->clear_lambda_data();
 
@@ -1465,14 +1676,12 @@ namespace Comp_Op
     double *lambda;
     lambda = (double *) calloc(2*N_dofs, sizeof(double));
 
-    unsigned int numIntegrationSteps = 100;
     timeHistory->lambda.resize(numIntegrationSteps + 1);
     timeHistory->lambda[numIntegrationSteps] = (double *) calloc(2*N_dofs, sizeof(double));
     timeHistory->lambda_time.resize(numIntegrationSteps + 1, 0.0);
     for (i = 1; i <= numIntegrationSteps; i++)
       {
         double ti = -T_max + i * T_max / (1.0*numIntegrationSteps);
-        std::cout << "TIME : " << ti << std::endl;
         int status = gsl_odeiv2_driver_apply (d, &t, ti, lambda);
 
         if (status != GSL_SUCCESS)
@@ -1488,9 +1697,12 @@ namespace Comp_Op
 
       }
 
+    free(lambda);
     gsl_odeiv2_driver_free (d);
 
-    std::cout << "Sucessfully Integrated the lambda ODE/\n";
+    timer = clock() - timer;
+
+    std::cout << "  Sucessfully Integrated the lambda ODE. Duration :  " << ((float)timer)/CLOCKS_PER_SEC << " seconds.\n";
 
   }
 
@@ -1498,16 +1710,17 @@ namespace Comp_Op
   {
 
     dh_drho.clear();
+    dh_drho_indicies.clear();
+    dh_drho_indicies.resize(N, std::vector<unsigned int> (0));
     for(unsigned int timeIndex = 0; timeIndex < timeHistory->numSteps; timeIndex ++)
     {
       double dimFactor = pow(2.0, DIM);
       double dimFactor_inv = 1.0/dimFactor;
 
-      dh_drho_indicies.resize(N, std::vector<unsigned int> (0));
       for( unsigned int beta = 0; beta < N; beta++)
       {
-        unsigned int elmID = ElmDatas[beta].elmID - 1;
-        double next_dK_factor = penal*pow(ElmDatas[beta].rho_, penal - 1.0);
+        unsigned int elmID = beta; // lmDatas[beta].elmID - 1;
+        double next_dK_factor = ElmDatas[beta].dE_drho_; // penal*pow(ElmDatas[beta].rho_, penal - 1.0);
         for(unsigned int i = 0; i < ElmDatas[beta].localToGlobal.size(); i ++)
         {
           int nextGlobalIndex = ElmDatas[beta].localToGlobal[i];
@@ -1522,7 +1735,7 @@ namespace Comp_Op
                                           std::vector<double> (timeHistory->numSteps, 0.0)));
             dh_drho_indicies[elmID].push_back(nextGlobalIndex);
           }
-          dh_drho[nextPair][timeIndex] +=  dimFactor_inv*ElmDatas[beta].volume_
+          dh_drho[nextPair][timeIndex] +=  density*dimFactor_inv*ElmDatas[beta].volume_
                                             *timeHistory->a[timeIndex][nextGlobalIndex];
 
           for(unsigned int j = 0; j < ElmDatas[beta].localToGlobal.size(); j ++)
@@ -1548,7 +1761,6 @@ namespace Comp_Op
     std::fill(sensitivities.begin(), sensitivities.end(), 0.0);
 
     unsigned int numLambdaSteps = timeHistory->lambda_time.size();
-    std::cout << "COWS : " << numLambdaSteps << std::endl;
     for(unsigned int beta = 0; beta < N; beta++)
     {
       std::vector<double> lambdah_beta( numLambdaSteps, 0.0);
@@ -1561,23 +1773,17 @@ namespace Comp_Op
         {
           lambdah_beta[j] += timeHistory->lambda[j][dh_drho_indicies[beta][i] + N_dofs]*
                 interpolate(timeHistory->t, dh_drho[nextPair], timeHistory->lambda_time[j], true);
-
-//          if(beta == 190)
-//          {
-//            std::cout << "HERE : " << timeHistory->lambda[j][dh_drho_indicies[beta][i] + N_dofs] << "   " << interpolate(timeHistory->t, dh_drho[nextPair], timeHistory->lambda_time[j], true) << std::endl;
-//          }
         }
       }
       for(unsigned int j = 0; j < numLambdaSteps-1; j ++)
       {
-        if(beta == 190)
-        std::cout  << timeHistory->lambda_time[j]<< std::endl;
+
         sensitivities[beta] += 0.5*(lambdah_beta[j] + lambdah_beta[j+1])*
             (timeHistory->lambda_time[j+1] - timeHistory->lambda_time[j]);
       }
 
-      if(beta == 190)
-        std::cout << "SENS : " << sensitivities[beta] << std::endl;
+      ElmDatas[beta].sensitivity_ = sensitivities[beta];
+
     }
   }
 
@@ -1588,7 +1794,7 @@ namespace Comp_Op
     double move = 0.2;
     std::vector<float> rho_new(N, 0.0);
     float V = 0.0;
-    while ((l2-l1) > 1e-4)
+    while ((l2-l1) > 1e-7)
     {
       double lmid = 0.5*(l2+l1);
       for(unsigned int i = 0; i < N; i ++)
@@ -1605,16 +1811,21 @@ namespace Comp_Op
       else
         l2 = lmid;
     }
-    std::cout << "Volume : " << V << std::endl;
+    std::cout << "  Volume : " << V << std::endl;
 
+    change = 0.0;
+    for(unsigned int i = 0; i < N; i ++)
+    {
+      if(fabs(rho[i] - rho_new[i]) > change)
+        change = fabs(rho[i] - rho_new[i]);
+    }
     rho = rho_new;
   }
 
   void compliance_opt::update_element_rhos()
   {
     for(unsigned int i = 0; i < ElmDatas.size(); i ++)
-      ElmDatas[i].update_rho(rho[i]);
-
+      ElmDatas[i].update_rho(rho[i], k1, k2);
   }
 
   void compliance_opt::update_element_neighbors()
@@ -1757,7 +1968,7 @@ namespace Comp_Op
         fprintf(vtkFile, "\n");
       }
     }
-    fprintf(vtkFile, "\nCELLS %u %u\n", ElmDatas.size(), (ElmDatas.size() + N*numVert));
+    fprintf(vtkFile, "\nCELLS %lu %lu\n", ElmDatas.size(), (ElmDatas.size() + N*numVert));
     unsigned int count = 0;
     for(unsigned int i = 0; i < N; i ++)
     {

@@ -40,7 +40,7 @@ namespace Comp_Op
      void add_neighbor( ElmData* nextElm, float dist)
        {neighborList.push_back(std::make_pair(nextElm, dist));}
      float dist(ElmData* otherElm);
-     void update_rho(float rho_new){rho_ = rho_new;}
+     void update_rho(float rho_new, double k1 = 1.0/3.0, double k2 = 3.0);
      void set_vol(float vol){volume_ = vol;};
      void print_info();
 
@@ -53,12 +53,20 @@ namespace Comp_Op
 
      float volume_;
      float rho_;
-     float sensitivity_ = 0.0;
+     float E_;
+     double dE_drho_;
+     float sensitivity_;
+
+
+
      double penal_;
      unsigned int elmID;
      unsigned int dim_;
      unsigned int num_vertex;
      unsigned int num_dofs;
+
+  private:
+     float t;
   };
 
   class TimeHistory
@@ -71,11 +79,10 @@ namespace Comp_Op
     void clear_lambda_data()
     {
       for(unsigned int i = 0; i < lambda.size(); i ++)
-        {
-          free(lambda[i]);
-          lambda.clear();
-          lambda_time.clear();
-        }
+        free(lambda[i]);
+
+      lambda_time.clear();
+      lambda.clear();
 
     };
 
@@ -102,10 +109,10 @@ namespace Comp_Op
     ~compliance_opt(){delete timeHistory;};
 
     void initialize(char* static_dir);
+    void read_input_file(char* fileName);
     float iterate(unsigned int iter, bool dakota = false);
     void postprocess();
     void update_rho();
-    void read_input_file(char* fileName);
 
     void write_element_file();
     void write_part_file();
@@ -181,19 +188,24 @@ namespace Comp_Op
 
     bool firstFlag;
     bool dynamicFlag;
+    bool cleanFlag;
 
     unsigned int N;
     unsigned int N_nodes;
     unsigned int N_dofs;
+
+    unsigned int numIntegrationSteps;
+    double k1, k2;
 
     float compliance;
 
     double F_max;
     double T_max;
     std::vector<unsigned int> forcedDofs;
+    float change;
 
   private:
-    unsigned int internal_iter = 0;
+    unsigned int internal_iter;
 
   };
 

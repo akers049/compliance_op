@@ -11,6 +11,7 @@
 #include <Eigen/Sparse>
 #include <Eigen/UmfPackSupport>
 #include <Eigen/SparseExtra>
+#include "MMASolver.h"
 
 #define DIM 2
 
@@ -72,10 +73,10 @@ namespace Comp_Op
   class TimeHistory
   {
   public:
-    TimeHistory(unsigned int nnodes, unsigned int ndofs, std::vector< std::vector<int> >  &node_ind);
+    TimeHistory(unsigned int nnodes, unsigned int ndofs, std::vector< std::vector<int> >  &node_ind, double Tmax);
     ~TimeHistory(){clear_lambda_data();};
 
-    void read_data(char *nodoutFile);
+    void read_data(char *nodoutFile, bool adjointFlag = false, bool loadSymFlag = false);
     void clear_lambda_data()
     {
       for(unsigned int i = 0; i < lambda.size(); i ++)
@@ -98,6 +99,8 @@ namespace Comp_Op
     std::vector< double* > lambda;
     std::vector< double >  lambda_time;
 
+    double T_max;
+
     unsigned int numSteps;
   };
 
@@ -106,19 +109,26 @@ namespace Comp_Op
 
   public:
     compliance_opt();
-    ~compliance_opt(){delete timeHistory;};
+    ~compliance_opt()
+    {
+      delete timeHistory;
+      delete timeHistory_adjoint;
+      delete MMA;
+    };
 
     void initialize(char* static_dir);
     void read_input_file(char* fileName);
     float iterate(unsigned int iter, bool dakota = false);
     void postprocess();
     void update_rho();
+    void update_rho_MMA();
 
     void write_element_file();
     void write_part_file();
-    void write_mat_file(const unsigned int iter, char *matFileName);
+    void write_mat_file(const unsigned int iter, char *matFileName, bool adjointFlag = false);
+    void write_adjoint_load_file(const unsigned int iter, char *loadFileName);
     void set_element_stiffness();
-    void run_ls_dyna(const unsigned int iter);
+    void run_ls_dyna(const unsigned int iter, bool adjointFlag = false);
 
     void read_node_data();
     void read_displacements();
@@ -152,7 +162,9 @@ namespace Comp_Op
     unsigned int read_dakota_param_input();
     void write_dakota_param_output();
 
+    MMASolver *MMA;
     TimeHistory *timeHistory;
+    TimeHistory *timeHistory_adjoint;
 
     std::vector<float> rho;
     std::vector<float> old_rho;
@@ -170,6 +182,7 @@ namespace Comp_Op
     std::vector<std::vector<double> > hessian;
     std::map< std::pair<unsigned int, unsigned int>, std::vector<double> > dh_drho;
     std::vector< std::vector<unsigned int> > dh_drho_indicies;
+
 
     char ls_static_dir[MAXLINE];
     char run_dir[MAXLINE];
@@ -189,6 +202,8 @@ namespace Comp_Op
     bool firstFlag;
     bool dynamicFlag;
     bool cleanFlag;
+    bool loadSymFlag;
+    bool MMA_flag;
 
     unsigned int N;
     unsigned int N_nodes;
@@ -196,6 +211,7 @@ namespace Comp_Op
 
     unsigned int numIntegrationSteps;
     double k1, k2;
+    double dispPower;
 
     float compliance;
 

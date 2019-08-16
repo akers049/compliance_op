@@ -19,9 +19,12 @@ find_package(GSL REQUIRED)    # See below (2)
 
 include_directories(${UMFPACK_INCLUDES})
 
+ADD_LIBRARY(MMASolver ${CMAKE_SOURCE_DIR}/source/MMASolver.cc)
+
 ADD_LIBRARY(compliance_opt ${CMAKE_SOURCE_DIR}/source/compliance_opt.cc)
 TARGET_LINK_LIBRARIES(compliance_opt umfpack)
 target_link_libraries(compliance_opt GSL::gsl GSL::gslcblas)
+TARGET_LINK_LIBRARIES(compliance_opt MMASolver)
 
 ADD_EXECUTABLE(run ${CMAKE_SOURCE_DIR}/source/run.cc)
 TARGET_LINK_LIBRARIES(run compliance_opt)

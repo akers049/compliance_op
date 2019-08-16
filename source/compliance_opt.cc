@@ -184,15 +184,16 @@ namespace Comp_Op
 
 
 /******************** time_history member functions **********************/
-  TimeHistory::TimeHistory(unsigned int nnodes, unsigned int ndofs, std::vector< std::vector<int> >  &node_ind)
+  TimeHistory::TimeHistory(unsigned int nnodes, unsigned int ndofs, std::vector< std::vector<int> >  &node_ind, double Tmax)
   {
     N_dofs = ndofs;
     N_nodes = nnodes;
     node_ind_dofs = &(node_ind);
     numSteps = 0;
+    T_max = Tmax;
   }
 
-  void TimeHistory::read_data(char *nodoutFile)
+  void TimeHistory::read_data(char *nodoutFile, bool adjointFlag, bool loadSymFlag)
   {
     double maxVal = 0.0;
     numSteps = 0;
@@ -333,6 +334,26 @@ namespace Comp_Op
     }
 
     timer = clock() - timer;
+
+
+    if(adjointFlag)
+    {
+      double multFactor = (loadSymFlag ? 1.0 : -1.0);
+      clear_lambda_data();
+      lambda.resize(numSteps);
+      lambda_time.resize(numSteps);
+      for(unsigned int i = 0; i < numSteps; i++)
+      {
+        lambda[i] = (double *) calloc(2*N_dofs, sizeof(double));
+        lambda_time[i] = T_max - t[numSteps - i - 1];
+
+        for(unsigned int k = 0; k < N_dofs; k++)
+        {
+          lambda[i][k] = multFactor*v[numSteps - i - 1][k];
+          lambda[i][k + N_dofs] = -multFactor*u[numSteps - i - 1][k];
+        }
+      }
+    }
 
     fclose(dispFile);
     std::cout << "  Sucessfully read in time history file with " << numSteps << " timesteps.\n";
@@ -530,7 +551,9 @@ namespace Comp_Op
 
     T_max = 0.0;
     F_max = 0.0;
+    MMA = NULL;
     timeHistory = NULL;
+    timeHistory_adjoint = NULL;
 
     internal_iter = 0;
     dynamicFlag = true;
@@ -541,6 +564,11 @@ namespace Comp_Op
 
     numIntegrationSteps = 100;
     cleanFlag = true;
+    loadSymFlag = true;
+    MMA_flag = true;
+
+    dispPower = 4.0;
+
   }
 
   void compliance_opt::read_input_file(char* fileName)
@@ -667,7 +695,10 @@ namespace Comp_Op
 
     read_node_data();
 
-    timeHistory = new TimeHistory(N_nodes, N_dofs, node_ind_dofs);
+    timeHistory = new TimeHistory(N_nodes, N_dofs, node_ind_dofs, T_max);
+    timeHistory_adjoint = new TimeHistory(N_nodes, N_dofs, node_ind_dofs, T_max);
+
+    MMA = new MMASolver(N, 1);
 
     write_element_file();
 
@@ -695,14 +726,25 @@ namespace Comp_Op
     }
     else
     {
-      set_stiffness_matrix();
-      set_mass_matrix();
+//      set_stiffness_matrix();
+//      set_mass_matrix();
 
       char dispFileName[MAXLINE];
       strcpy(dispFileName, iter_dir);
       strcat(dispFileName, "/nodout");
+
+      char dispFileName_2[MAXLINE];
+      strcpy(dispFileName_2, dispFileName);
+      strcat(dispFileName_2, "_forward");
       timeHistory->read_data(dispFileName);
-      integrate_dynamic_lambda();
+
+      // adjoint run
+      if(!loadSymFlag)
+        run_ls_dyna(0, true);
+
+      timeHistory_adjoint->read_data(dispFileName, true, loadSymFlag);
+
+//      integrate_dynamic_lambda();
       compute_dynamic_dhdrho();
       integrate_dynamic_sensitivity();
       compute_dynamic_objective();
@@ -733,7 +775,11 @@ namespace Comp_Op
     if((internal_iter != 0 && !dynamicFlag) ||
          (dynamicFlag && internal_iter > 1))
     {
-      update_rho();
+      if(MMA_flag)
+        update_rho_MMA();
+      else
+        update_rho();
+
       update_element_rhos();
     }
 
@@ -759,11 +805,11 @@ namespace Comp_Op
 
   }
 
-  void compliance_opt::run_ls_dyna(const unsigned int iter)
+  void compliance_opt::run_ls_dyna(const unsigned int iter, bool adjointFlag)
   {
 //    chdir(run_dir);
     char matFileName[MAXLINE];
-    write_mat_file(iter, matFileName);
+    write_mat_file(iter, matFileName, adjointFlag);
 
     char command[MAXLINE];
 
@@ -776,6 +822,13 @@ namespace Comp_Op
         matFileName);
 
     strcat(command, runCommand);
+
+//    if(adjointFlag)
+//    {
+//      char mv_command[MAXLINE];
+//      strcpy(mv_command, "mv nodout nodout_forward;");
+//      system(mv_command);
+//    }
 
     system(command);
 
@@ -1058,7 +1111,7 @@ namespace Comp_Op
     chdir(run_dir);
   }
 
-  void compliance_opt::write_mat_file(const unsigned int iter, char *matFileName)
+  void compliance_opt::write_mat_file(const unsigned int iter, char *matFileName, bool adjointFlag)
   {
     char iter_char[8];
     sprintf(iter_char, "%u", iter);
@@ -1066,6 +1119,8 @@ namespace Comp_Op
 
     strcpy(matFileName, "ls_mat_");
     strcat(matFileName, iter_char);
+    if(adjointFlag)
+      strcat(matFileName, "_adjoint");
     strcat(matFileName, ".k");
 
     FILE* matFile;
@@ -1097,8 +1152,10 @@ namespace Comp_Op
 
     if(dynamicFlag == false)
       sprintf(ls_info_path, "ls_info.k");
-    else
+    else if(adjointFlag == false)
       sprintf(ls_info_path, "ls_info_dynamic.k");
+    else if(adjointFlag == true)
+      sprintf(ls_info_path, "ls_info_dynamic_adjoint.k");
 
     unsigned int lines = std::floor((1.0*strlen(ls_info_path))/78.0);
     for(unsigned int i = 0; i < lines; i ++)
@@ -1109,6 +1166,13 @@ namespace Comp_Op
     }
     fprintf(matFile, "%s\n", &(ls_info_path[lines*78]));
 
+    if(adjointFlag)
+    {
+      char loadFileAdjoint[MAXLINE];
+      write_adjoint_load_file(iter, loadFileAdjoint);
+      fprintf(matFile, "*include\n%s\n", loadFileAdjoint);
+    }
+
     fprintf(matFile, "*END");
 
     fclose(matFile);
@@ -1117,6 +1181,40 @@ namespace Comp_Op
 
   }
 
+  void compliance_opt::write_adjoint_load_file(const unsigned int iter, char *loadFileName)
+  {
+    char iter_char[8];
+    sprintf(iter_char, "%u", iter);
+    strcpy(iter_dir, ".");
+
+    strcpy(loadFileName, "ls_adjoint_load_");
+    strcat(loadFileName, iter_char);
+
+    strcat(loadFileName, ".k");
+
+    FILE* loadFile;
+    loadFile = fopen(loadFileName, "w");
+    if(loadFile == NULL)
+    {
+      std::cout << "Error opening file, Exiting.\n" << std::endl;
+      exit(1);
+    }
+
+    fprintf(loadFile, "*keyword\n");
+    fprintf(loadFile, "*DEFINE_CURVE_TITLE\ntheForce\n");
+    fprintf(loadFile, "$#    lcid      sidr       sfa       sfo      offa      offo    dattyp     lcint\n");
+    fprintf(loadFile, "         1         0       1.0       1.0       0.0       0.0         0         0\n");
+    for(unsigned int i = 0; i < timeHistory->numSteps; i ++)
+    {
+      unsigned int nextIndex = timeHistory->numSteps - i - 1;
+      double nextVal = -dispPower*pow(timeHistory->u[nextIndex][forcedDofs[0]], dispPower-1.0);
+      double nextTime = T_max - timeHistory->t[nextIndex];
+      fprintf(loadFile, "    %16f    %16f\n", nextTime, nextVal);
+    }
+
+    fprintf(loadFile, "*END");
+    fclose(loadFile);
+  }
 
 
   void compliance_opt::read_displacements()
@@ -1643,12 +1741,15 @@ namespace Comp_Op
 //        sensitivities_filtered[i] = 0.0;
     }
 
-    std::vector<double>::iterator maxIt;
-    maxIt = std::max_element(sensitivities_filtered.begin(), sensitivities_filtered.end());
-    double maxVal =  *maxIt;
-    if(maxVal > 0.0)
-      for(unsigned int beta = 0; beta < N; beta++)
-        sensitivities_filtered[beta] -= maxVal;
+    if(!MMA_flag)
+    {
+      std::vector<double>::iterator maxIt;
+      maxIt = std::max_element(sensitivities_filtered.begin(), sensitivities_filtered.end());
+      double maxVal =  *maxIt;
+      if(maxVal > 0.0)
+        for(unsigned int beta = 0; beta < N; beta++)
+          sensitivities_filtered[beta] -= maxVal;
+    }
 
   }
 
@@ -1676,9 +1777,9 @@ namespace Comp_Op
     double *lambda;
     lambda = (double *) calloc(2*N_dofs, sizeof(double));
 
-    timeHistory->lambda.resize(numIntegrationSteps + 1);
-    timeHistory->lambda[numIntegrationSteps] = (double *) calloc(2*N_dofs, sizeof(double));
-    timeHistory->lambda_time.resize(numIntegrationSteps + 1, 0.0);
+    timeHistory_adjoint->lambda.resize(numIntegrationSteps + 1);
+    timeHistory_adjoint->lambda[numIntegrationSteps] = (double *) calloc(2*N_dofs, sizeof(double));
+    timeHistory_adjoint->lambda_time.resize(numIntegrationSteps + 1, 0.0);
     for (i = 1; i <= numIntegrationSteps; i++)
       {
         double ti = -T_max + i * T_max / (1.0*numIntegrationSteps);
@@ -1690,10 +1791,10 @@ namespace Comp_Op
             break;
           }
 
-        timeHistory->lambda_time[numIntegrationSteps - i] = -ti;
-        timeHistory->lambda[numIntegrationSteps - i] = (double *) calloc(2*N_dofs, sizeof(double));
+        timeHistory_adjoint->lambda_time[numIntegrationSteps - i] = -ti;
+        timeHistory_adjoint->lambda[numIntegrationSteps - i] = (double *) calloc(2*N_dofs, sizeof(double));
         for(unsigned int j = 0; j < 2*N_dofs; j ++)
-          timeHistory->lambda[numIntegrationSteps - i][j] = lambda[j];
+          timeHistory_adjoint->lambda[numIntegrationSteps - i][j] = lambda[j];
 
       }
 
@@ -1760,7 +1861,7 @@ namespace Comp_Op
     // zero out sensitivities
     std::fill(sensitivities.begin(), sensitivities.end(), 0.0);
 
-    unsigned int numLambdaSteps = timeHistory->lambda_time.size();
+    unsigned int numLambdaSteps = timeHistory_adjoint->lambda_time.size();
     for(unsigned int beta = 0; beta < N; beta++)
     {
       std::vector<double> lambdah_beta( numLambdaSteps, 0.0);
@@ -1771,15 +1872,14 @@ namespace Comp_Op
 
         for(unsigned int j = 0; j < numLambdaSteps; j ++)
         {
-          lambdah_beta[j] += timeHistory->lambda[j][dh_drho_indicies[beta][i] + N_dofs]*
-                interpolate(timeHistory->t, dh_drho[nextPair], timeHistory->lambda_time[j], true);
+          lambdah_beta[j] += timeHistory_adjoint->lambda[j][dh_drho_indicies[beta][i] + N_dofs]*
+                interpolate(timeHistory->t, dh_drho[nextPair], timeHistory_adjoint->lambda_time[j], true);
         }
       }
       for(unsigned int j = 0; j < numLambdaSteps-1; j ++)
       {
-
         sensitivities[beta] += 0.5*(lambdah_beta[j] + lambdah_beta[j+1])*
-            (timeHistory->lambda_time[j+1] - timeHistory->lambda_time[j]);
+            (timeHistory_adjoint->lambda_time[j+1] - timeHistory_adjoint->lambda_time[j]);
       }
 
       ElmDatas[beta].sensitivity_ = sensitivities[beta];
@@ -1820,6 +1920,58 @@ namespace Comp_Op
         change = fabs(rho[i] - rho_new[i]);
     }
     rho = rho_new;
+  }
+
+  void compliance_opt::update_rho_MMA()
+  {
+    double *xmin = new double[N];
+    double *xmax = new double[N];
+
+    double f = compliance;
+    double *df = new double[N];
+
+    double g = 0.0;
+    double *dg = new double[N];
+
+    double *x = new double[N];
+
+    for(unsigned int i = 0; i < N; i++)
+    {
+      df[i] = sensitivities_filtered[i];
+
+      xmin[i] = ((rho[i] - 0.2) > rhoMin ? rho[i] - 0.2 : rhoMin);
+      xmax[i] = ((rho[i] + 0.2) < 1.0 ? rho[i] + 0.2 : 1.0);
+
+      g += rho[i]*ElmDatas[i].volume_;
+      dg[i] = ElmDatas[i].volume_;
+
+      x[i] = rho[i];
+    }
+
+    g -= (1.000001)*volFrac*V_tot;
+
+    MMA->Update(x,df,&g,dg,xmin,xmax);
+
+    change = 0.0;
+    double V = 0.0;
+    for(unsigned int i = 0; i < N; i ++)
+    {
+      if(fabs(rho[i] - x[i]) > change)
+        change = fabs(rho[i] - x[i]);
+
+      rho[i] = x[i];
+
+      V += x[i]*ElmDatas[i].volume_;
+    }
+
+    delete [] xmin;
+    delete [] xmax;
+    delete [] df;
+    delete [] dg;
+    delete [] x;
+
+    std::cout << "  Volume : " << V << std::endl;
+
   }
 
   void compliance_opt::update_element_rhos()

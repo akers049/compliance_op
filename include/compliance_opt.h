@@ -10,7 +10,6 @@
 #include <cstdlib>
 #include <Eigen/Sparse>
 #include <Eigen/UmfPackSupport>
-#include <Eigen/SparseExtra>
 #include "MMASolver.h"
 
 #define DIM 2
@@ -145,9 +144,15 @@ namespace Comp_Op
     void update_element_neighbors();
 
     void integrate_dynamic_lambda();
+    void setup_dh_drho_vector();
+    void get_next_dh_drho(std::vector<std::vector< double > > &dh_drho_j,unsigned int elmID);
+    void get_next_dh_drho_time(std::vector<double> &dh_drho_j,unsigned int elmID, unsigned int timeIndex);
+    void compute_dynamic_sensitivity_fast();
     void compute_dynamic_dhdrho();
     void integrate_dynamic_sensitivity();
+    void compute_dynamic_sensitivity_time_discrete();
     float compute_dynamic_objective();
+    float compute_dynamic_disp_obejctive();
 
 
     void write_vtk(unsigned int iter);
@@ -181,6 +186,7 @@ namespace Comp_Op
     Eigen::SparseMatrix<double> M;
     std::vector<std::vector<double> > hessian;
     std::map< std::pair<unsigned int, unsigned int>, std::vector<double> > dh_drho;
+    std::vector<std::vector<std::vector <double> > > dh_drho_vector;
     std::vector< std::vector<unsigned int> > dh_drho_indicies;
 
 
@@ -204,6 +210,7 @@ namespace Comp_Op
     bool cleanFlag;
     bool loadSymFlag;
     bool MMA_flag;
+    bool dispObjectiveFlag;
 
     unsigned int N;
     unsigned int N_nodes;
@@ -214,11 +221,14 @@ namespace Comp_Op
     double dispPower;
 
     float compliance;
+    float dispObjective;
 
     double F_max;
     double T_max;
     std::vector<unsigned int> forcedDofs;
     float change;
+
+    double objectiveFactor;
 
   private:
     unsigned int internal_iter;

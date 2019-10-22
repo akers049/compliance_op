@@ -7,6 +7,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 
@@ -59,17 +60,24 @@ int main()
 
   std::fill(co.rho.begin(), co.rho.end(), 0.5);
   co.update_element_rhos();
+  co.setup_dh_drho_vector();
 
   getcwd(co.dynamic_init_dir, MAXLINE);
   strcat(co.dynamic_init_dir, "/iter_0");
 
   co.dynamicFlag = true;
-  for(unsigned int i = 1; i < 250; i ++)
+  for(unsigned int i = 1; i < 3000; i ++)
   {
+    clock_t timer = clock();
+
     std::cout << "\nITERATATION : " << i << std::endl;
     co.iterate(i);
     std::cout << "OBJECTIVE : " << co.compliance << std::endl;
     std::cout << "Change : " << co.change << std::endl;
+    timer = clock() - timer;
+    std::cout << "  Time For Iteration : " << ((float)timer)/CLOCKS_PER_SEC << " seconds.\n";
+
+
 
     if(co.change < 0.015)
     {

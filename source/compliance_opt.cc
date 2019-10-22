@@ -47,6 +47,38 @@ double interpolate( std::vector<double> &xData, std::vector<double> &yData, doub
    return yL + dydx * ( x - xL );                                              // linear interpolation
 }
 
+double interpolate_with_index( std::vector<double> &xData, std::vector<double> &yData, unsigned int interpIndex, double x, bool extrapolate )
+{
+   double xL = xData[interpIndex], yL = yData[interpIndex],
+       xR = xData[interpIndex+1], yR = yData[interpIndex+1];      // points on either side (unless beyond ends)
+   if ( !extrapolate )                                                         // if beyond ends of array and not extrapolating
+   {
+      if ( x < xL ) yR = yL;
+      if ( x > xR ) yL = yR;
+   }
+
+   double dydx = ( yR - yL ) / ( xR - xL );                                    // gradient
+
+   return yL + dydx * ( x - xL );                                              // linear interpolation
+}
+
+unsigned int find_interpolation_index( std::vector<double> &xData, double x)
+{
+  unsigned int L = 0;
+  unsigned int R = xData.size();
+  unsigned int m;
+  while(L < R)
+  {
+    m = (L + R)/2;
+    if(xData[m] < x)
+      L = m + 1;
+    else
+      R = m;
+  }
+
+  return L-1;
+}
+
 double loadingFunction(double t, double F_max, double dT)
 {
   double f = ((F_max*2.0/dT)*fabs(-t - dT/2.0) - F_max);
@@ -247,7 +279,7 @@ namespace Comp_Op
           getNextDataLine(dispFile, nextLine, MAXLINE, &dummy, true); //blank lines
           for(unsigned int i = 0; i < N_nodes; i ++)
           {
-            getNextDataLine(dispFile, nextLine, MAXLINE, &dummy, true); //blank lines
+            getNextDataLine(dispFile, nextLine, MAXLINE, &dummy, true);
 
             // read data and node number
 //            valuesWritten = sscanf(nextLine, "%u %lf %lf %lf %lf %lf %lf %lf %lf %lf",
@@ -302,11 +334,11 @@ namespace Comp_Op
               if(fabs(nextVals[j]) < 1e-15)
                 nextVals[j] = 0.0;
 
-              if(numSteps == 3)
-              {
+//              if(numSteps == 3)
+//              {
                 if(fabs(nextVals[j]) > maxVal)
                   maxVal = fabs(nextVals[j]);
-              }
+//              }
 
             }
             for(unsigned int j = 0; j < DIM; j ++)
@@ -564,10 +596,14 @@ namespace Comp_Op
 
     numIntegrationSteps = 100;
     cleanFlag = true;
-    loadSymFlag = true;
+    loadSymFlag = false;
     MMA_flag = true;
 
     dispPower = 4.0;
+    dispObjectiveFlag = true;
+    dispObjective = 0.0;
+
+    objectiveFactor = 5000.0;
 
   }
 
@@ -739,15 +775,24 @@ namespace Comp_Op
       timeHistory->read_data(dispFileName);
 
       // adjoint run
-      if(!loadSymFlag)
-        run_ls_dyna(0, true);
-
-      timeHistory_adjoint->read_data(dispFileName, true, loadSymFlag);
+//      if(!loadSymFlag)
+//        run_ls_dyna(0, true);
+//
+//      timeHistory_adjoint->read_data(dispFileName, true, loadSymFlag);
 
 //      integrate_dynamic_lambda();
-      compute_dynamic_dhdrho();
-      integrate_dynamic_sensitivity();
-      compute_dynamic_objective();
+
+   //   compute_dynamic_dhdrho();
+   //   integrate_dynamic_sensitivity();
+
+//      compute_dynamic_sensitivity_fast();
+
+      compute_dynamic_sensitivity_time_discrete();
+
+      if(dispObjectiveFlag)
+        compliance = compute_dynamic_disp_obejctive();
+      else
+        compute_dynamic_objective();
     }
 
     filter_sensitivities();
@@ -1166,7 +1211,7 @@ namespace Comp_Op
     }
     fprintf(matFile, "%s\n", &(ls_info_path[lines*78]));
 
-    if(adjointFlag)
+    if(adjointFlag && dispObjectiveFlag)
     {
       char loadFileAdjoint[MAXLINE];
       write_adjoint_load_file(iter, loadFileAdjoint);
@@ -1209,7 +1254,7 @@ namespace Comp_Op
       unsigned int nextIndex = timeHistory->numSteps - i - 1;
       double nextVal = -dispPower*pow(timeHistory->u[nextIndex][forcedDofs[0]], dispPower-1.0);
       double nextTime = T_max - timeHistory->t[nextIndex];
-      fprintf(loadFile, "    %16f    %16f\n", nextTime, nextVal);
+      fprintf(loadFile, "    %16lg    %16lg\n", nextTime, nextVal);
     }
 
     fprintf(loadFile, "*END");
@@ -1579,6 +1624,24 @@ namespace Comp_Op
     return compliance;
   }
 
+  float compliance_opt::compute_dynamic_disp_obejctive()
+  {
+    dispObjective = 0.0;
+    for(unsigned int i = 0; i < timeHistory->numSteps - 1; i++)
+    {
+      double u_ave  = 0.5*(timeHistory->u[i][forcedDofs[0]] +
+                           timeHistory->u[i+1][forcedDofs[0]]);
+
+      dispObjective += pow(u_ave, dispPower)*(timeHistory->t[i + 1] - timeHistory->t[i]);
+//      dispObjective += 0.5*( pow(timeHistory->u[i][forcedDofs[0]], dispPower) +
+//          pow(timeHistory->u[i+1][forcedDofs[0]], dispPower))
+//              *(timeHistory->t[i + 1] - timeHistory->t[i]);
+    }
+
+    dispObjective *= objectiveFactor;
+    return dispObjective;
+  }
+
   void compliance_opt::compute_sensitivities()
   {
 
@@ -1807,8 +1870,105 @@ namespace Comp_Op
 
   }
 
+  void compliance_opt::setup_dh_drho_vector()
+  {
+    dh_drho_indicies.clear();
+    dh_drho_indicies.resize(N, std::vector<unsigned int> (0));
+
+    // initialize sizes of dh_drho_vector and stuff
+    for( unsigned int beta = 0; beta < N; beta++)
+    {
+      unsigned int elmID = beta; // lmDatas[beta].elmID - 1;
+      double next_dK_factor = ElmDatas[beta].dE_drho_; // penal*pow(ElmDatas[beta].rho_, penal - 1.0);
+      for(unsigned int i = 0; i < ElmDatas[beta].localToGlobal.size(); i ++)
+      {
+        int nextGlobalIndex = ElmDatas[beta].localToGlobal[i];
+        if( nextGlobalIndex == -1)
+          continue;
+
+        dh_drho_indicies[elmID].push_back(nextGlobalIndex);
+      }
+    }
+  }
+
+  void compliance_opt::get_next_dh_drho_time(std::vector<double> &dh_drho_j,unsigned int elmID, unsigned int timeIndex)
+  {
+    unsigned int next_M = (dh_drho_indicies[elmID]).size();
+    unsigned int numTimeSteps = timeHistory->numSteps;
+    dh_drho_j.clear();
+    dh_drho_j.resize(next_M, 0.0);
+
+    double next_dK_factor = ElmDatas[elmID].dE_drho_; // penal*pow(ElmDatas[beta].rho_, penal - 1.0);
+
+//    for(unsigned int timeIndex = 0; timeIndex < numTimeSteps; timeIndex ++)
+//    {
+      double dimFactor = pow(2.0, DIM);
+      double dimFactor_inv = 1.0/dimFactor;
+      for(unsigned int i = 0; i < dh_drho_indicies[elmID].size(); i ++)
+      {
+        int nextGlobalIndex = dh_drho_indicies[elmID][i];
+
+        dh_drho_j[i] +=  density*dimFactor_inv*ElmDatas[elmID].volume_
+                                          *timeHistory->a[timeIndex][nextGlobalIndex];
+
+        for(unsigned int j = 0; j < dh_drho_indicies[elmID].size(); j ++)
+        {
+          int nextGlobalIndex_2 = dh_drho_indicies[elmID][j];
+
+          dh_drho_j[i] += next_dK_factor*
+              ElmDatas[elmID].elmStiffnessMat[i][j]*timeHistory->u[timeIndex][nextGlobalIndex_2];
+
+        }
+//      }
+      }
+
+  }
+
+  void compliance_opt::get_next_dh_drho(std::vector<std::vector< double > > &dh_drho_j,unsigned int elmID)
+  {
+    unsigned int next_M = (dh_drho_indicies[elmID]).size();
+    unsigned int numTimeSteps = timeHistory->numSteps;
+    dh_drho_j.clear();
+    dh_drho_j.resize(next_M, std::vector<double> (numTimeSteps, 0.0));
+
+    double next_dK_factor = ElmDatas[elmID].dE_drho_; // penal*pow(ElmDatas[beta].rho_, penal - 1.0);
+
+    for(unsigned int timeIndex = 0; timeIndex < numTimeSteps; timeIndex ++)
+    {
+      double dimFactor = pow(2.0, DIM);
+      double dimFactor_inv = 1.0/dimFactor;
+      for(unsigned int i = 0; i < dh_drho_indicies[elmID].size(); i ++)
+      {
+        int nextGlobalIndex = dh_drho_indicies[elmID][i];
+
+        dh_drho_j[i][timeIndex] +=  density*dimFactor_inv*ElmDatas[elmID].volume_
+                                          *timeHistory->a[timeIndex][nextGlobalIndex];
+
+        for(unsigned int j = 0; j < dh_drho_indicies[elmID].size(); j ++)
+        {
+          int nextGlobalIndex_2 = dh_drho_indicies[elmID][j];
+
+          dh_drho_j[i][timeIndex] += next_dK_factor*
+              ElmDatas[elmID].elmStiffnessMat[i][j]*timeHistory->u[timeIndex][nextGlobalIndex_2];
+
+        }
+      }
+    }
+
+  }
+
   void compliance_opt::compute_dynamic_dhdrho()
   {
+
+//    // start by resizing the vectors with time
+//    for(unsigned int beta = 0; beta < N; beta++)
+//    {
+//      for (unsigned int i = 0; i < dh_drho_vector[beta].size(); i ++)
+//      {
+//        std::fill(dh_drho_vector[beta][i].begin(), dh_drho_vector[beta][i].end(), 0.0);
+//        dh_drho_vector[beta][i].resize(timeHistory->numSteps, 0.0);
+//      }
+//    }
 
     dh_drho.clear();
     dh_drho_indicies.clear();
@@ -1855,6 +2015,47 @@ namespace Comp_Op
     }
   }
 
+  void compliance_opt::compute_dynamic_sensitivity_fast()
+  {
+    // zero out sensitivities
+    std::fill(sensitivities.begin(), sensitivities.end(), 0.0);
+
+    unsigned int numLambdaSteps = timeHistory_adjoint->lambda_time.size();
+
+    // get interpolation indicies
+    std::vector<unsigned int> interp_indicies(numLambdaSteps);
+    for(unsigned int  j = 0; j < numLambdaSteps; j ++)
+    {
+      interp_indicies[j] = find_interpolation_index(timeHistory->t,
+          timeHistory_adjoint->lambda_time[j]);
+    }
+
+    for(unsigned int beta = 0; beta < N; beta++)
+    {
+      std::vector<std::vector<double> > next_dh_drho_beta;
+      get_next_dh_drho(next_dh_drho_beta, beta);
+      std::vector<double> lambdah_beta( numLambdaSteps, 0.0);
+
+      for(unsigned int i = 0; i < dh_drho_indicies[beta].size(); i ++)
+      {
+
+        for(unsigned int j = 0; j < numLambdaSteps; j ++)
+        {
+          lambdah_beta[j] += timeHistory_adjoint->lambda[j][dh_drho_indicies[beta][i] + N_dofs]*
+                interpolate_with_index(timeHistory->t, next_dh_drho_beta[i],
+                    interp_indicies[j], timeHistory_adjoint->lambda_time[j], true);
+        }
+      }
+      for(unsigned int j = 0; j < numLambdaSteps-1; j ++)
+      {
+        sensitivities[beta] += objectiveFactor*0.5*(lambdah_beta[j] + lambdah_beta[j+1])*
+            (timeHistory_adjoint->lambda_time[j+1] - timeHistory_adjoint->lambda_time[j]);
+      }
+
+      ElmDatas[beta].sensitivity_ = sensitivities[beta];
+
+    }
+  }
 
   void compliance_opt::integrate_dynamic_sensitivity()
   {
@@ -1878,13 +2079,67 @@ namespace Comp_Op
       }
       for(unsigned int j = 0; j < numLambdaSteps-1; j ++)
       {
-        sensitivities[beta] += 0.5*(lambdah_beta[j] + lambdah_beta[j+1])*
+        sensitivities[beta] += objectiveFactor*0.5*(lambdah_beta[j] + lambdah_beta[j+1])*
             (timeHistory_adjoint->lambda_time[j+1] - timeHistory_adjoint->lambda_time[j]);
       }
 
       ElmDatas[beta].sensitivity_ = sensitivities[beta];
 
     }
+  }
+
+  void compliance_opt::compute_dynamic_sensitivity_time_discrete()
+  {
+    std::fill(sensitivities.begin(), sensitivities.end(), 0.0);
+
+
+    std::vector<double> delta_t(timeHistory->numSteps - 1, 0.0);
+
+
+    for(unsigned int i = 0; i < timeHistory->numSteps - 1; i ++)
+      delta_t[i] = timeHistory->t[i+1] - timeHistory->t[i];
+
+    std::vector<double> invMassVect(N_dofs, 0.0);
+    for (unsigned int j = 0; j < M.outerSize(); ++j)
+      for (Eigen::SparseMatrix<double>::InnerIterator it((M),j); it; ++it)
+        invMassVect[it.row()] = 1.0/it.value();
+
+    std::vector<double> lambda(N_dofs, 0.0);
+    std::vector<double> eta(N_dofs, 0.0);
+    std::vector<double> mu(N_dofs, 0.0);
+    unsigned int numSteps = timeHistory->numSteps;
+
+    for(unsigned int i = 1; i < numSteps - 1; i ++)
+    {
+      for (unsigned int j = 0; j < K.outerSize(); ++j)
+        for (Eigen::SparseMatrix<double>::InnerIterator it((K),j); it; ++it)
+        {
+          mu[it.row()] -= it.value()*lambda[it.col()];
+        }
+      mu[forcedDofs[0]] -= dispPower*pow( timeHistory->u[numSteps - 1 - i][forcedDofs[0]], dispPower - 1.0)*delta_t[numSteps -1 - i];
+
+
+      double nextHalf_dt = 0.5*(delta_t[numSteps -1 -i] + delta_t[numSteps - 2 - i]);
+      for(unsigned int j = 0; j < N_dofs; j++)
+      {
+        eta[j] += mu[j]*nextHalf_dt;
+        lambda[j] = invMassVect[j]*eta[j]*delta_t[numSteps -1 - i];
+      }
+
+      for(unsigned int beta = 0; beta < N; beta++)
+      {
+        std::vector<double> next_dh_drho_beta;
+        get_next_dh_drho_time(next_dh_drho_beta, beta, numSteps -1 -i);
+        for(unsigned int k = 0; k < dh_drho_indicies[beta].size(); k ++)
+        {
+          sensitivities[beta] += lambda[dh_drho_indicies[beta][k]]*next_dh_drho_beta[k];
+        }
+      }
+    }
+
+    for(unsigned int beta = 0; beta < N; beta++)
+      ElmDatas[beta].sensitivity_ = sensitivities[beta];
+
   }
 
   void compliance_opt::update_rho()
@@ -1939,8 +2194,8 @@ namespace Comp_Op
     {
       df[i] = sensitivities_filtered[i];
 
-      xmin[i] = ((rho[i] - 0.2) > rhoMin ? rho[i] - 0.2 : rhoMin);
-      xmax[i] = ((rho[i] + 0.2) < 1.0 ? rho[i] + 0.2 : 1.0);
+      xmin[i] = ((rho[i] - 0.4) > rhoMin ? rho[i] - 0.4 : rhoMin);
+      xmax[i] = ((rho[i] + 0.4) < 1.0 ? rho[i] + 0.4 : 1.0);
 
       g += rho[i]*ElmDatas[i].volume_;
       dg[i] = ElmDatas[i].volume_;
